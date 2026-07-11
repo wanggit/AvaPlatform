@@ -1,0 +1,52 @@
+# AI 数字员工平台本地依赖容器：PostgreSQL、Redis 和 MinIO。
+name: ai-platform
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg15
+    container_name: ai-platform-postgres
+    environment:
+      POSTGRES_DB: ai_platform
+      POSTGRES_USER: ai_platform
+      POSTGRES_PASSWORD: ai_platform_dev_password
+    ports:
+      - "127.0.0.1:15432:5432"
+    volumes:
+      - ai_platform_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ai_platform -d ai_platform"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: docker.m.daocloud.io/redis:8.2
+    container_name: ai-platform-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "127.0.0.1:16379:6379"
+    volumes:
+      - ai_platform_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  minio:
+    image: pgsty/minio:RELEASE.2026-03-25T00-00-00Z
+    container_name: ai-platform-minio
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ai_platform
+      MINIO_ROOT_PASSWORD: ai_platform_dev_password
+    ports:
+      - "127.0.0.1:19000:9000"
+      - "127.0.0.1:19001:9001"
+    volumes:
+      - ai_platform_minio_data:/data
+
+volumes:
+  ai_platform_postgres_data:
+  ai_platform_redis_data:
+  ai_platform_minio_data:
