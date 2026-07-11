@@ -39,6 +39,25 @@ def create_goal(api: TestClient, budget_tokens: int = 1000) -> str:
     }).json()["id"]
 
 
+def test_goal_run_accepts_legacy_frontend_fields() -> None:
+    api = client()
+    employee_id = create_employee(api)
+
+    response = api.post("/api/v1/goal-runs", json={
+        "name": "处理客户升级投诉",
+        "rootOwnerId": employee_id,
+        "budgetTokens": 1000,
+        "policy": {"risk_level": "L2"},
+    })
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["title"] == "处理客户升级投诉"
+    assert body["goal_type"] == "manual"
+    assert body["owner"] == employee_id
+    assert body["budget_tokens"] == 1000
+
+
 def create_work_item(api: TestClient, goal_id: str, employee_id: str) -> str:
     return api.post("/api/v1/work-items", json={
         "goal_run_id": goal_id,

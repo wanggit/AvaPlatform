@@ -60,6 +60,40 @@ def test_model_configuration_uses_platform_credential_and_selection_filter(monke
     assert api.get("/api/v1/model-configurations?enabled=true&model_type=embedding_model").json() == []
 
 
+def test_model_configuration_accepts_frontend_type_aliases() -> None:
+    api = client()
+    credential = api.post("/api/v1/credentials", json={
+        "name": "OpenAI 兼容密钥",
+        "owner_type": "platform",
+        "owner_id": "platform",
+        "owner_name": "Platform",
+        "secret_value": "dev-secret",
+    }).json()
+
+    defaulted = api.post("/api/v1/model-configurations", json={
+        "name": "默认大模型",
+        "provider": "OpenAI Compatible",
+        "base_url": "https://example.com/v1",
+        "api_key_credential_id": credential["id"],
+        "model_name": "demo-chat",
+        "context_window": 8192,
+    })
+    assert defaulted.status_code == 201
+    assert defaulted.json()["model_type"] == "large_language_model"
+
+    aliased = api.post("/api/v1/model-configurations", json={
+        "name": "别名向量模型",
+        "type": "embedding",
+        "provider": "OpenAI Compatible",
+        "base_url": "https://example.com/v1",
+        "api_key_credential_id": credential["id"],
+        "model_name": "demo-embedding",
+        "context_window": 8192,
+    })
+    assert aliased.status_code == 201
+    assert aliased.json()["model_type"] == "embedding_model"
+
+
 def test_skill_package_upload_requires_zip_with_skill_manifest_and_binds_template() -> None:
     api = client()
 
@@ -98,6 +132,19 @@ def test_skill_package_upload_requires_zip_with_skill_manifest_and_binds_templat
     })
     assert binding.status_code == 200
     assert binding.json()["skill_package_ids"] == [skill_id]
+
+
+def test_skill_package_upload_derives_missing_package_file_name() -> None:
+    api = client()
+
+    uploaded = api.post("/api/v1/skill-packages", json={
+        "name": "通用写作技能",
+        "version": "1.2.3",
+        "package_content_base64": skill_zip_base64({"SKILL.md": "# 通用写作技能\n"}),
+    })
+
+    assert uploaded.status_code == 201
+    assert uploaded.json()["package_file_name"].endswith("-1.2.3.zip")
 
 
 def test_business_tool_fields_and_idempotency_publish_gate() -> None:

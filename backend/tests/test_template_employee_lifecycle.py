@@ -71,6 +71,17 @@ def test_create_employee_starts_rollout_job() -> None:
     assert body["rollout"]["status"] == "running"
 
 
+def test_create_employee_accepts_avatar_alias() -> None:
+    api = client()
+    payload = employee_payload()
+    payload["avatar"] = payload.pop("avatar_url")
+
+    response = api.post("/api/v1/digital-employees", json=payload)
+
+    assert response.status_code == 201
+    assert response.json()["avatar_url"] == "https://example.com/avatar.png"
+
+
 def test_activate_employee_computes_availability() -> None:
     api = client()
     employee_id = api.post("/api/v1/digital-employees", json=employee_payload()).json()["id"]

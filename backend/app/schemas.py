@@ -3,7 +3,7 @@
 from typing import Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field, model_validator
 
 
 def new_id(prefix: str) -> str:
@@ -128,7 +128,7 @@ class RolloutState(BaseModel):
 class DigitalEmployeeCreate(BaseModel):
     name: str
     nickname: str | None = None
-    avatar_url: str
+    avatar_url: str = Field(validation_alias=AliasChoices("avatar_url", "avatar", "avatarUrl"))
     department_id: str
     manager_id: str | None = None
     job_template_version_id: str
@@ -192,7 +192,7 @@ class CredentialRead(BaseModel):
 
 class ModelConfigurationCreate(BaseModel):
     name: str
-    model_type: ModelType
+    model_type: ModelType = Field(default="large_language_model", validation_alias=AliasChoices("model_type", "type"))
     provider: str
     base_url: str
     api_key_credential_id: str
@@ -200,6 +200,27 @@ class ModelConfigurationCreate(BaseModel):
     context_window: int = Field(gt=0)
     metadata: dict = Field(default_factory=dict)
     enabled: bool = True
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_model_type(cls, data: object) -> object:
+        if not isinstance(data, dict):
+            return data
+        model_type = data.get("model_type", data.get("type"))
+        normalized = {
+            "llm": "large_language_model",
+            "chat": "large_language_model",
+            "completion": "large_language_model",
+            "embedding": "embedding_model",
+            "rerank": "rerank_model",
+            "vision": "vision_model",
+            "audio": "speech_model",
+            "speech": "speech_model",
+        }.get(model_type)
+        if normalized:
+            data = dict(data)
+            data["model_type"] = normalized
+        return data
 
 
 class ModelConfigurationPatch(BaseModel):
@@ -229,9 +250,18 @@ class ModelConnectionTestResult(BaseModel):
 class SkillPackageUpload(BaseModel):
     name: str
     version: str
-    package_file_name: str
+    package_file_name: str | None = Field(default=None, validation_alias=AliasChoices("package_file_name", "packageFileName", "package_file", "packageFile"))
     package_content_base64: str
     description: str | None = None
+
+    @model_validator(mode="after")
+    def fill_package_file_name(self) -> "SkillPackageUpload":
+        if self.package_file_name:
+            return self
+        safe_name = "".join(char if char.isalnum() or char in ("-", "_") else "-" for char in self.name).strip("-")
+        safe_version = "".join(char if char.isalnum() or char in ("-", "_", ".") else "-" for char in self.version).strip("-")
+        self.package_file_name = f"{safe_name or 'skill'}-{safe_version or '1.0.0'}.zip"
+        return self
 
 
 class SkillPackagePatch(BaseModel):
@@ -371,13 +401,33 @@ class EmployeeServiceTokenRead(BaseModel):
 
 
 class GoalRunCreate(BaseModel):
-    title: str
-    goal_type: str
-    description: str
-    owner: str
-    root_responsible: str
-    budget_tokens: int = Field(gt=0)
+    title: str = "未命名目标"
+    goal_type: str = "manual"
+    description: str = ""
+    owner: str = ""
+    root_responsible: str = ""
+    budget_tokens: int = Field(default=200_000, gt=0)
     policy: dict = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_goal_fields(cls, data: object) -> object:
+        if not isinstance(data, dict):
+            return data
+        normalized = dict(data)
+        if "title" not in normalized:
+            normalized["title"] = normalized.get("name") or normalized.get("goalTitle") or "未命名目标"
+        if "goal_type" not in normalized:
+            normalized["goal_type"] = normalized.get("goalType") or "manual"
+        if "description" not in normalized:
+            normalized["description"] = normalized["title"]
+        if "owner" not in normalized:
+            normalized["owner"] = normalized.get("rootOwnerId") or normalized.get("owner_id") or normalized.get("root_responsible") or ""
+        if "root_responsible" not in normalized:
+            normalized["root_responsible"] = normalized.get("rootResponsible") or normalized.get("rootOwnerName") or normalized.get("owner") or ""
+        if "budget_tokens" not in normalized:
+            normalized["budget_tokens"] = normalized.get("budgetTokens") or normalized.get("budget") or 200_000
+        return normalized
 
 
 class GoalRunRead(GoalRunCreate):
