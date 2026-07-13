@@ -62,6 +62,18 @@ class JobTemplateEvaluationUpdate(BaseModel):
     cases: list[JobTemplateEvaluationCase] = Field(default_factory=list)
 
 
+class TemplateEvaluationRunRequest(BaseModel):
+    task_description: str
+
+
+class TemplateEvaluationRunResponse(BaseModel):
+    run_id: str
+    task_description: str
+    hermes_output: str
+    status: Literal["completed", "error"]
+    error_message: str | None = None
+
+
 class DepartmentCreate(BaseModel):
     name: str
     description: str | None = None
@@ -195,7 +207,7 @@ class ModelConfigurationCreate(BaseModel):
     model_type: ModelType = Field(default="large_language_model", validation_alias=AliasChoices("model_type", "type"))
     provider: str
     base_url: str
-    api_key_credential_id: str
+    api_key: str
     model_name: str
     context_window: int = Field(gt=0)
     metadata: dict = Field(default_factory=dict)
@@ -228,7 +240,7 @@ class ModelConfigurationPatch(BaseModel):
     model_type: ModelType | None = None
     provider: str | None = None
     base_url: str | None = None
-    api_key_credential_id: str | None = None
+    api_key: str | None = None
     model_name: str | None = None
     context_window: int | None = Field(default=None, gt=0)
     metadata: dict | None = None

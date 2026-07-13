@@ -1,7 +1,7 @@
 // Skill 管理页面：上传 zip 技能包、发布技能并供岗位模板绑定。
 import { useState } from 'react';
 import { Button, Card, Col, Descriptions, Form, Input, Modal, Row, Select, Space, Table, Tag, Typography, Upload } from 'antd';
-import { EditOutlined, EyeOutlined, PlusOutlined, SendOutlined, StopOutlined, UploadOutlined } from '@ant-design/icons';
+import { DeleteOutlined, EditOutlined, EyeOutlined, PlusOutlined, SendOutlined, StopOutlined, UploadOutlined } from '@ant-design/icons';
 import { type SkillDefinition } from '../types/domain';
 import { usePlatformData } from '../services/platformData';
 import { api } from '../services/api';
@@ -34,7 +34,7 @@ const toPackageFileList = (skill: SkillDefinition) => [
 ];
 
 export default function SkillManagement() {
-  const { skills, source, refresh } = usePlatformData();
+  const { skills, source, refreshSkills } = usePlatformData();
   const [editOpen, setEditOpen] = useState(false);
   const [detailOpen, setDetailOpen] = useState(false);
   const [editingSkill, setEditingSkill] = useState<SkillDefinition | null>(null);
@@ -81,7 +81,7 @@ export default function SkillManagement() {
         if (nextValues.status === 'published' && editingSkill.status !== 'published') {
           await api.post(`/skill-packages/${editingSkill.id}/publish`);
         }
-        await refresh();
+        await refreshSkills();
       } else {
         const file = values.packageFile?.[0]?.originFileObj as File | undefined;
         if (!file) throw new Error('请上传技能压缩包');
@@ -95,7 +95,7 @@ export default function SkillManagement() {
         if (values.status === 'published') {
           await api.post(`/skill-packages/${created.id}/publish`);
         }
-        await refresh();
+        await refreshSkills();
       }
       setEditOpen(false);
       setEditingSkill(null);
@@ -105,9 +105,18 @@ export default function SkillManagement() {
 
   const togglePublish = async (skillId: string) => {
     const skill = skills.find((item) => item.id === skillId);
-    if (!skill || skill.status === 'published') return;
-    await api.post(`/skill-packages/${skillId}/publish`);
-    await refresh();
+    if (!skill) return;
+    if (skill.status === 'published') {
+      await api.post(`/skill-packages/${skillId}/unpublish`);
+    } else {
+      await api.post(`/skill-packages/${skillId}/publish`);
+    }
+    await refreshSkills();
+  };
+
+  const deleteSkill = async (skillId: string) => {
+    await api.delete(`/skill-packages/${skillId}`);
+    await refreshSkills();
   };
 
   const columns = [
@@ -138,7 +147,7 @@ export default function SkillManagement() {
     {
       title: '操作',
       key: 'action',
-      width: 220,
+      width: 300,
       render: (_: unknown, row: SkillDefinition) => (
         <Space size="small">
           <Button size="small" icon={<EyeOutlined />} onClick={() => { setSelectedSkill(row); setDetailOpen(true); }}>详情</Button>
@@ -147,11 +156,20 @@ export default function SkillManagement() {
             size="small"
             type={row.status === 'published' ? 'default' : 'primary'}
             icon={row.status === 'published' ? <StopOutlined /> : <SendOutlined />}
-            disabled={row.status === 'published'}
             onClick={() => togglePublish(row.id)}
           >
             {row.status === 'published' ? '下架' : '发布'}
           </Button>
+          {row.status !== 'published' && (
+            <Button
+              size="small"
+              danger
+              icon={<DeleteOutlined />}
+              onClick={() => deleteSkill(row.id)}
+            >
+              删除
+            </Button>
+          )}
         </Space>
       ),
     },

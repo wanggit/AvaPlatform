@@ -5,6 +5,8 @@ import binascii
 import hashlib
 import io
 import json
+import threading
+import time
 import zipfile
 from threading import RLock
 from typing import Any, Literal
@@ -13,7 +15,8 @@ import httpx
 
 from app.config import settings
 from app.db.relational_state import load_relational_state, save_relational_state
-from app.integrations.hermes import HermesClient
+from app.integrations.hermes import HermesClient, HermesDashboardClient
+from app.runtime.port_pool import PortPool
 
 
 class ConflictError(ValueError):
@@ -142,7 +145,7 @@ class InMemoryStore:
                 model_type="large_language_model",
                 provider=settings.default_llm_provider,
                 base_url=settings.default_llm_base_url,
-                api_key_credential_id="cred-default-llm",
+                api_key="cred-default-llm",
                 model_name=settings.default_llm_model,
                 context_window=settings.default_llm_context_window,
                 enabled=True,
@@ -204,7 +207,27 @@ class InMemoryStore:
         self.template_versions: dict[str, JobTemplateVersionRead] = {}
         self.employees: dict[str, DigitalEmployeeRead] = {}
 
+        # 评测基础设施
+        self.port_pool = PortPool(
+            start=settings.eval_port_range_start,
+            end=settings.eval_port_range_end,
+        )
+        self._eval_locks: dict[str, threading.Lock] = {}
+        self._dashboard = HermesDashboardClient(
+            settings.hermes_dashboard_url,
+            settings.hermes_api_key,
+        )
+
     def _audit(self, event_type: str, payload: dict) -> str:
+        audit_id = new_id("audit")
+        self.audit_events.append(AuditEventRead(id=audit_id, event_type=event_type, payload=payload))
+        return audit_id
+
+    def _eval_lock_for(self, version_id: str) -> threading.Lock:
+        """获取模板版本级别的评测锁，防止并发评测。"""
+        if version_id not in self._eval_locks:
+            self._eval_locks[version_id] = threading.Lock()
+        return self._eval_locks[version_id]
         audit_id = new_id("audit")
         self.audit_events.append(AuditEventRead(id=audit_id, event_type=event_type, payload=payload))
         return audit_id
@@ -307,9 +330,26 @@ class InMemoryStore:
         return updated
 
     def delete_credential(self, credential_id: str) -> bool:
-        credential = self.credentials.pop(credential_id, None)
+        credential = self.credentials.get(credential_id)
         if not credential:
             return False
+        # 检查凭证是否被工具引用
+        referencing_tools: list[str] = []
+        for tool in self.tools.values():
+            if getattr(tool, "credential_id", None) == credential_id:
+                referencing_tools.append(f"{tool.name}（{tool.id}）")
+        # 检查凭证是否被知识库连接引用
+        referencing_connections: list[str] = []
+        for conn in self.knowledge_connections.values():
+            if getattr(conn, "credential_id", None) == credential_id:
+                referencing_connections.append(f"{conn.name}（{conn.id}）")
+        all_references = referencing_tools + referencing_connections
+        if all_references:
+            raise ValueError(
+                f"凭证「{credential.name}」仍被以下资源引用，不能删除：\n"
+                + "\n".join(f"  - {ref}" for ref in all_references)
+            )
+        del self.credentials[credential_id]
         self.secret_values.pop(credential.secret_ref, None)
         return True
 
@@ -325,7 +365,6 @@ class InMemoryStore:
         return self.model_configurations.get(model_id)
 
     def create_model_configuration(self, payload: ModelConfigurationCreate) -> ModelConfigurationRead:
-        self._require_credential(payload.api_key_credential_id)
         model_id = new_id("model")
         model = ModelConfigurationRead(id=model_id, test_status="not_tested", **payload.model_dump())
         self.model_configurations[model_id] = model
@@ -336,9 +375,6 @@ class InMemoryStore:
         if not model:
             return None
         patch = payload.model_dump(exclude_unset=True)
-        credential_id = patch.get("api_key_credential_id")
-        if credential_id:
-            self._require_credential(credential_id)
         data = model.model_dump()
         data.update(patch)
         updated = ModelConfigurationRead(**data)
@@ -346,12 +382,28 @@ class InMemoryStore:
         return updated
 
     def delete_model_configuration(self, model_id: str) -> bool:
+        model = self.model_configurations.get(model_id)
+        if model is None:
+            return False
+        if model.enabled:
+            raise ConflictError("只有已停用的模型才能删除，请先停用该模型。")
         return self.model_configurations.pop(model_id, None) is not None
 
     def set_model_enabled(self, model_id: str, enabled: bool) -> ModelConfigurationRead | None:
         model = self.model_configurations.get(model_id)
         if not model:
             return None
+        if not enabled:
+            referencing = [
+                version
+                for version in self.template_versions.values()
+                if version.model_config_id == model_id
+            ]
+            if referencing:
+                names = "\n".join(f"  - {version.role}（{version.grade}）" for version in referencing)
+                raise ConflictError(
+                    f"以下岗位模板仍在使用该模型，无法停用：\n{names}\n请先将这些模板切换到其他模型后再操作。"
+                )
         updated = model.model_copy(update={"enabled": enabled})
         self.model_configurations[model_id] = updated
         return updated
@@ -360,9 +412,9 @@ class InMemoryStore:
         model = self.model_configurations.get(model_id)
         if not model:
             return None
-        if not model.base_url.startswith("http") or not model.model_name or model.api_key_credential_id not in self.credentials:
+        if not model.base_url.startswith("http") or not model.model_name or not model.api_key:
             status = "failed"
-            message = "模型配置缺少基础地址、模型名称或凭据。"
+            message = "模型配置缺少基础地址、模型名称或密钥。"
         else:
             try:
                 message = self._probe_model_connection(model)
@@ -375,7 +427,7 @@ class InMemoryStore:
 
     def _probe_model_connection(self, model: ModelConfigurationRead) -> str:
         provider = model.provider.lower()
-        api_key = self._credential_secret(model.api_key_credential_id)
+        api_key = model.api_key
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
         base_url = model.base_url.rstrip("/")
         try:
@@ -456,6 +508,41 @@ class InMemoryStore:
         updated = skill.model_copy(update={"status": "published"})
         self.skill_packages[skill_id] = updated
         return updated
+
+    def unpublish_skill_package(self, skill_id: str) -> SkillPackageRead | None:
+        skill = self.skill_packages.get(skill_id)
+        if not skill:
+            return None
+        if skill.status != "published":
+            raise ValueError("只有已发布的技能才能下架")
+        # 检查是否有岗位模板引用了此技能
+        referencing_templates = self._find_templates_referencing_skill(skill_id)
+        if referencing_templates:
+            raise ValueError(f"技能被以下岗位模板引用，无法下架: {', '.join(referencing_templates)}")
+        updated = skill.model_copy(update={"status": "draft"})
+        self.skill_packages[skill_id] = updated
+        self._audit("skill_package_unpublished", {"skill_package_id": skill_id})
+        return updated
+
+    def _find_templates_referencing_skill(self, skill_id: str) -> list[str]:
+        """查找引用了指定技能的岗位模板名称列表。"""
+        referencing: list[str] = []
+        for version_id, binding in self.template_skill_bindings.items():
+            if skill_id in binding.skill_package_ids:
+                version = self.template_versions.get(version_id)
+                if version:
+                    referencing.append(f"{version.role}({version.id})")
+        return referencing
+
+    def delete_skill_package(self, skill_id: str) -> bool:
+        skill = self.skill_packages.get(skill_id)
+        if not skill:
+            return False
+        if skill.status == "published":
+            raise ValueError("已发布的技能无法删除，请先下架")
+        del self.skill_packages[skill_id]
+        self._audit("skill_package_deleted", {"skill_package_id": skill_id})
+        return True
 
     def bind_skills_to_template(self, version_id: str, payload: TemplateSkillBindingCreate) -> TemplateSkillBindingRead:
         if version_id not in self.template_versions:
@@ -1417,6 +1504,19 @@ class InMemoryStore:
         self._audit("job_template_version_status_changed", {"job_template_version_id": version_id, "status": status})
         return updated
 
+    def delete_job_template_version(self, version_id: str) -> bool:
+        version = self.template_versions.get(version_id)
+        if not version:
+            return False
+        # 检查是否有数字员工引用了此模板
+        for emp in self.employees.values():
+            if emp.job_template_version_id == version_id:
+                raise ValueError(f"数字员工 {emp.role}（{emp.id}）正在使用此模板，请先删除该员工")
+        del self.template_versions[version_id]
+        self.goal_budget_policies.pop(version_id, None)
+        self._audit("job_template_version_deleted", {"job_template_version_id": version_id})
+        return True
+
     def get_template_evaluation(self, version_id: str) -> JobTemplateEvaluationRead | None:
         version = self.template_versions.get(version_id)
         return version.evaluation if version else None
@@ -1439,7 +1539,168 @@ class InMemoryStore:
         self.template_versions[version_id] = version.model_copy(update={"evaluation": evaluation})
         return evaluation
 
-    def list_digital_employees(self) -> list[DigitalEmployeeRead]:
+    def _render_evaluation_soul(self, version: JobTemplateVersionRead) -> str:
+        """将模板配置渲染为 Hermes Profile 的 SOUL.md 内容。"""
+        parts: list[str] = []
+        parts.append(f"# {version.role} ({version.grade})\n")
+        if version.description:
+            parts.append(f"## 岗位说明\n{version.description}\n")
+        if version.system_prompt:
+            parts.append(f"## 系统提示词\n{version.system_prompt}\n")
+        if version.skills:
+            parts.append("## 可用技能\n")
+            for skill_id in version.skills:
+                skill = self.skill_packages.get(skill_id)
+                label = f"{skill.name} v{skill.version}" if skill else skill_id
+                parts.append(f"- {label}")
+            parts.append("")
+        if version.tools:
+            parts.append("## 工具白名单\n")
+            for tool_id in version.tools:
+                tool = self.tools.get(tool_id)
+                label = tool.name if tool else tool_id
+                parts.append(f"- {label}")
+            parts.append("")
+        if version.knowledge_sources:
+            parts.append("## 知识源\n")
+            for ks_id in version.knowledge_sources:
+                ks = self.knowledge_sources.get(ks_id)
+                label = ks.display_name if ks else ks_id
+                parts.append(f"- {label}")
+            parts.append("")
+        if version.red_lines:
+            parts.append("## 红线（绝对禁止行为）\n")
+            for rl in version.red_lines:
+                parts.append(f"- {rl}")
+            parts.append("")
+        return "\n".join(parts)
+
+    def run_template_evaluation(self, version_id: str, task_description: str) -> dict:
+        """全流程模板评测：创建临时 Profile → 启动 Gateway → 执行 Run → 清理资源。
+
+        步骤：
+        1. 获取并发锁，防止同一模板同时评测
+        2. 分配端口，创建临时 Hermes Profile
+        3. 写入 SOUL.md（system_prompt + skills + tools + knowledge + red_lines）
+        4. 设置模型，启动 Gateway，等待就绪
+        5. 调用 Hermes 执行评测任务
+        6. finally 块保证 Gateway、Profile、端口全部清理
+        """
+        version = self.template_versions.get(version_id)
+        if not version:
+            raise ValueError("岗位模板版本不存在")
+
+        lock = self._eval_lock_for(version_id)
+        if not lock.acquire(blocking=False):
+            raise ConflictError("该模板版本正在评测中，请等待当前评测完成后再试。")
+
+        port: int | None = None
+        profile_name: str | None = None
+        try:
+            # 1. 分配端口
+            port = self.port_pool.allocate()
+            profile_name = f"eval-{version_id[:30]}-{int(time.time())}"
+
+            self._audit("template_evaluation_profile_creating", {
+                "template_version_id": version_id,
+                "profile_name": profile_name,
+                "port": port,
+            })
+
+            # 2. 创建临时 Profile
+            model_config = self.model_configurations.get(version.model_config_id)
+            provider = model_config.provider if model_config else settings.default_llm_provider
+            model = model_config.model_name if model_config else settings.default_llm_model
+            self._dashboard.create_profile(
+                profile_name,
+                model_provider=provider,
+                model_name=model,
+            )
+
+            # 3. 写入 SOUL.md
+            soul_content = self._render_evaluation_soul(version)
+            self._dashboard.write_soul(profile_name, soul_content)
+
+            # 4. 启动 Gateway
+            self._dashboard.start_gateway(profile_name)
+
+            # 5. 等待 Gateway 就绪
+            ready = self._dashboard.wait_gateway_ready(
+                port,
+                timeout_seconds=settings.eval_gateway_start_timeout_seconds,
+            )
+            if not ready:
+                raise RuntimeError(
+                    f"Gateway 启动超时（{settings.eval_gateway_start_timeout_seconds}s），"
+                    f"端口 {port}，Profile: {profile_name}"
+                )
+
+            self._audit("template_evaluation_gateway_ready", {
+                "template_version_id": version_id,
+                "profile_name": profile_name,
+                "port": port,
+            })
+
+            # 6. 执行评测任务
+            hermes = HermesClient(
+                f"http://127.0.0.1:{port}",
+                settings.hermes_api_key,
+                timeout_seconds=settings.eval_run_timeout_seconds,
+            )
+            result = hermes.create_and_wait_run(
+                task_description,
+                metadata={"purpose": "template_evaluation", "template_version_id": version_id},
+                max_wait_seconds=settings.eval_run_timeout_seconds,
+            )
+            run_id = result.get("run_id") or result.get("id") or "unknown"
+            output = result.get("output") or json.dumps(result, ensure_ascii=False)
+            run_status = result.get("status", "unknown")
+            is_completed = run_status == "completed"
+
+            self._audit("template_evaluation_run_completed", {
+                "template_version_id": version_id,
+                "run_id": run_id,
+                "hermes_status": run_status,
+                "profile_name": profile_name,
+                "port": port,
+            })
+
+            return {
+                "run_id": run_id,
+                "task_description": task_description,
+                "hermes_output": output,
+                "status": "completed" if is_completed else "error",
+                "error_message": None if is_completed else f"Hermes 运行状态: {run_status}",
+            }
+
+        except (httpx.HTTPError, ValueError, RuntimeError) as exc:
+            self._audit("template_evaluation_run_failed", {
+                "template_version_id": version_id,
+                "profile_name": profile_name,
+                "port": port,
+                "error": str(exc),
+            })
+            return {
+                "run_id": "",
+                "task_description": task_description,
+                "hermes_output": "",
+                "status": "error",
+                "error_message": str(exc),
+            }
+        finally:
+            # 清理顺序：Gateway → Profile → Port
+            if profile_name:
+                try:
+                    self._dashboard.stop_gateway(profile_name)
+                except Exception:
+                    pass
+                try:
+                    self._dashboard.delete_profile(profile_name)
+                except Exception:
+                    pass
+            if port is not None:
+                self.port_pool.release(port)
+            lock.release()
         return list(self.employees.values())
 
     def get_digital_employee(self, employee_id: str) -> DigitalEmployeeRead | None:
@@ -1580,6 +1841,8 @@ class PostgresBackedStore(InMemoryStore):
         "upload_skill_package",
         "patch_skill_package",
         "publish_skill_package",
+        "unpublish_skill_package",
+        "delete_skill_package",
         "bind_skills_to_template",
         "create_business_tool",
         "patch_tool",
@@ -1615,8 +1878,10 @@ class PostgresBackedStore(InMemoryStore):
         "evaluate_audit_rule",
         "create_job_template_version",
         "patch_job_template_version",
+        "delete_job_template_version",
         "set_job_template_version_status",
         "update_template_evaluation",
+        "run_template_evaluation",
         "create_digital_employee",
         "patch_employee_organization",
         "patch_employee_runtime",

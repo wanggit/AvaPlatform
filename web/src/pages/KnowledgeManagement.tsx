@@ -54,6 +54,8 @@ export default function KnowledgeManagement() {
     templates,
     source,
     refresh,
+    refreshKnowledgeConnection,
+    refreshKnowledgeSources,
   } = usePlatformData();
   const [connectionOpen, setConnectionOpen] = useState(false);
   const [sourceOpen, setSourceOpen] = useState(false);
@@ -104,7 +106,7 @@ export default function KnowledgeManagement() {
           credential_id: values.apiKeyRef,
         });
       }
-      await refresh();
+      await refreshKnowledgeConnection();
       setConnectionOpen(false);
     });
   };
@@ -112,7 +114,7 @@ export default function KnowledgeManagement() {
   const testConnection = async () => {
     if (!connection.id) return;
     await api.post(`/knowledge-connections/${connection.id}/test`);
-    await refresh();
+    await refreshKnowledgeConnection();
   };
 
   const syncDatasets = async () => {
@@ -141,7 +143,7 @@ export default function KnowledgeManagement() {
           authorization_scope: [values.category],
           retrieval_settings: { top_k: 5 },
         });
-        await refresh();
+        await refreshKnowledgeSources();
         setSourceOpen(false);
         setEditingSource(null);
         sourceForm.resetFields();
@@ -153,7 +155,7 @@ export default function KnowledgeManagement() {
         retrieval_settings: { description: values.description, top_k: 5 },
         status: values.status === 'active' ? 'active' : 'archived',
       });
-      await refresh();
+      await refreshKnowledgeSources();
       setSourceOpen(false);
       setEditingSource(null);
       sourceForm.resetFields();
@@ -166,7 +168,7 @@ export default function KnowledgeManagement() {
     await api.patch(`/knowledge-sources/${sourceId}`, {
       status: source.status === 'active' ? 'archived' : 'active',
     });
-    await refresh();
+    await refreshKnowledgeSources();
   };
 
   const runPreview = async (sourceIds = previewSourceIds, query = previewQuery) => {

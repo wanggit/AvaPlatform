@@ -22,13 +22,27 @@ import {
   type TemplateOutcomeReport,
   type UsageAnalyticsRow,
 } from '../types/domain';
-import { fetchPlatformData } from './api';
+import { api, fetchPlatformData, mapAuditEvent, mapAuditRule, mapCredential, mapDepartment, mapGoal, mapGoalBudgetPolicy, mapKnowledgeConnection, mapKnowledgeSource, mapModel, mapQuota, mapSkill, mapTemplate, mapTool, type BackendModel } from './api';
 
 interface PlatformData {
   source: 'backend' | 'unavailable';
   loading: boolean;
   error?: string;
   refresh: () => Promise<void>;
+  refreshModels: () => Promise<void>;
+  refreshDepartments: () => Promise<void>;
+  refreshEmployees: () => Promise<void>;
+  refreshTemplates: () => Promise<void>;
+  refreshTools: () => Promise<void>;
+  refreshCredentials: () => Promise<void>;
+  refreshKnowledgeConnection: () => Promise<void>;
+  refreshKnowledgeSources: () => Promise<void>;
+  refreshAuditEvents: () => Promise<void>;
+  refreshAuditRules: () => Promise<void>;
+  refreshQuota: () => Promise<void>;
+  refreshGoalBudgets: () => Promise<void>;
+  refreshGoals: () => Promise<void>;
+  refreshSkills: () => Promise<void>;
   templates: JobTemplate[];
   setTemplates: React.Dispatch<React.SetStateAction<JobTemplate[]>>;
   departments: Department[];
@@ -146,6 +160,106 @@ export function PlatformDataProvider({ children }: { children: ReactNode }) {
     }
   };
 
+  const refreshModels = async () => {
+    try {
+      const data = await api.get<BackendModel[]>('/model-configurations');
+      setModels(data.map(mapModel));
+    } catch {
+      // 静默失败，保留已有数据
+    }
+  };
+
+  const refreshDepartments = async () => {
+    try {
+      const data = await api.get<Parameters<typeof mapDepartment>[0][]>('/departments');
+      setDepartments(data.map(mapDepartment));
+    } catch { /* 静默失败 */ }
+  };
+
+  const refreshEmployees = async () => {
+    try {
+      const data = await api.get<Parameters<typeof mapEmployee>[0][]>('/digital-employees');
+      setEmployees(data.map(mapEmployee));
+    } catch { /* 静默失败 */ }
+  };
+
+  const refreshTemplates = async () => {
+    try {
+      const data = await api.get<Parameters<typeof mapTemplate>[0][]>('/job-template-versions');
+      setTemplates(data.map(mapTemplate));
+    } catch { /* 静默失败 */ }
+  };
+
+  const refreshTools = async () => {
+    try {
+      const data = await api.get<Parameters<typeof mapTool>[0][]>('/tools');
+      setTools(data.map(mapTool));
+    } catch { /* 静默失败 */ }
+  };
+
+  const refreshCredentials = async () => {
+    try {
+      const data = await api.get<Parameters<typeof mapCredential>[0][]>('/credentials');
+      setCredentials(data.map(mapCredential));
+    } catch { /* 静默失败 */ }
+  };
+
+  const refreshKnowledgeConnection = async () => {
+    try {
+      const data = await api.get<Parameters<typeof mapKnowledgeConnection>[0][]>('/knowledge-connections');
+      if (data[0]) setKnowledgeConnection(mapKnowledgeConnection(data[0]));
+    } catch { /* 静默失败 */ }
+  };
+
+  const refreshKnowledgeSources = async () => {
+    try {
+      const data = await api.get<Parameters<typeof mapKnowledgeSource>[0][]>('/knowledge-sources');
+      setKnowledgeSources(data.map(mapKnowledgeSource));
+    } catch { /* 静默失败 */ }
+  };
+
+  const refreshAuditEvents = async () => {
+    try {
+      const data = await api.get<Parameters<typeof mapAuditEvent>[0][]>('/audit/events');
+      setAuditEvents(data.map(mapAuditEvent));
+    } catch { /* 静默失败 */ }
+  };
+
+  const refreshAuditRules = async () => {
+    try {
+      const data = await api.get<Parameters<typeof mapAuditRule>[0][]>('/audit/rules');
+      setAuditRules(data.map(mapAuditRule));
+    } catch { /* 静默失败 */ }
+  };
+
+  const refreshQuota = async () => {
+    try {
+      const data = await api.get<Parameters<typeof mapQuota>[0]>('/quota/organization');
+      setOrganizationQuota(mapQuota(data));
+    } catch { /* 静默失败 */ }
+  };
+
+  const refreshGoalBudgets = async () => {
+    try {
+      const data = await api.get<Parameters<typeof mapGoalBudgetPolicy>[0][]>('/quota/goal-budgets');
+      setGoalBudgetPolicies(data.map(mapGoalBudgetPolicy));
+    } catch { /* 静默失败 */ }
+  };
+
+  const refreshGoals = async () => {
+    try {
+      const data = await api.get<Parameters<typeof mapGoal>[0][]>('/goal-runs');
+      setGoals(data.map(mapGoal));
+    } catch { /* 静默失败 */ }
+  };
+
+  const refreshSkills = async () => {
+    try {
+      const data = await api.get<Parameters<typeof mapSkill>[0][]>('/skill-packages');
+      setSkills(data.map(mapSkill));
+    } catch { /* 静默失败 */ }
+  };
+
   useEffect(() => {
     void refresh();
   }, []);
@@ -155,6 +269,20 @@ export function PlatformDataProvider({ children }: { children: ReactNode }) {
     loading,
     error,
     refresh,
+    refreshModels,
+    refreshDepartments,
+    refreshEmployees,
+    refreshTemplates,
+    refreshTools,
+    refreshCredentials,
+    refreshKnowledgeConnection,
+    refreshKnowledgeSources,
+    refreshAuditEvents,
+    refreshAuditRules,
+    refreshQuota,
+    refreshGoalBudgets,
+    refreshGoals,
+    refreshSkills,
     templates,
     setTemplates,
     departments,
@@ -193,7 +321,7 @@ export function PlatformDataProvider({ children }: { children: ReactNode }) {
     setAuditRules,
     auditNotifications,
     setAuditNotifications,
-  }), [source, loading, error, templates, departments, employees, models, skills, tools, credentials, knowledgeConnection, knowledgeSources, organizationQuota, goalBudgetPolicies, tokenLedger, usageAnalytics, goals, templateOutcomeReports, alertMessages, auditEvents, auditRules, auditNotifications]);
+  }), [source, loading, error, refresh, refreshModels, refreshDepartments, refreshEmployees, refreshTemplates, refreshTools, refreshCredentials, refreshKnowledgeConnection, refreshKnowledgeSources, refreshAuditEvents, refreshAuditRules, refreshQuota, refreshGoalBudgets, refreshGoals, refreshSkills, templates, departments, employees, models, skills, tools, credentials, knowledgeConnection, knowledgeSources, organizationQuota, goalBudgetPolicies, tokenLedger, usageAnalytics, goals, templateOutcomeReports, alertMessages, auditEvents, auditRules, auditNotifications]);
 
   return <PlatformDataContext.Provider value={value}>{children}</PlatformDataContext.Provider>;
 }

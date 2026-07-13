@@ -267,7 +267,7 @@ def _save_credentials(
 def _load_model_configurations(connection: psycopg.Connection) -> dict[str, dict[str, Any]]:
     rows = connection.execute(
         """
-        SELECT id, name, model_type, provider, base_url, credential_id, model_name,
+        SELECT id, name, model_type, provider, base_url, api_key, model_name,
                context_window, status, metadata_json
         FROM model_configurations
         ORDER BY name
@@ -280,7 +280,7 @@ def _load_model_configurations(connection: psycopg.Connection) -> dict[str, dict
             "model_type": row["model_type"],
             "provider": row["provider"],
             "base_url": row["base_url"],
-            "api_key_credential_id": row["credential_id"],
+            "api_key": row["api_key"],
             "model_name": row["model_name"],
             "context_window": row["context_window"],
             "metadata": row["metadata_json"] or {},
@@ -297,7 +297,7 @@ def _save_model_configurations(connection: psycopg.Connection, models: dict[str,
         connection.execute(
             """
             INSERT INTO model_configurations (
-                id, name, model_type, provider, base_url, credential_id, model_name,
+                id, name, model_type, provider, base_url, api_key, model_name,
                 context_window, status, metadata_json
             )
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
@@ -308,7 +308,7 @@ def _save_model_configurations(connection: psycopg.Connection, models: dict[str,
                 model["model_type"],
                 model["provider"],
                 model["base_url"],
-                model["api_key_credential_id"],
+                model["api_key"],
                 model["model_name"],
                 model["context_window"],
                 "active" if model.get("enabled", True) else "disabled",

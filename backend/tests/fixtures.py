@@ -44,7 +44,7 @@ def reset_with_catalog() -> None:
         model_type="large_language_model",
         provider="deepseek",
         base_url="https://api.deepseek.com",
-        api_key_credential_id="cred-deepseek",
+        api_key="sk-test-deepseek",
         model_name="deepseek-v4-pro",
         context_window=128_000,
         enabled=True,

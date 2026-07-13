@@ -69,6 +69,8 @@ from app.schemas import (
     SkillPackageUpload,
     TemplateSkillBindingCreate,
     TemplateSkillBindingRead,
+    TemplateEvaluationRunRequest,
+    TemplateEvaluationRunResponse,
     OrganizationQuotaPolicyCreate,
     OrganizationQuotaPolicyRead,
     TemplateOutcomeReportRead,
@@ -166,7 +168,11 @@ def patch_credential(credential_id: str, payload: CredentialPatch) -> Credential
 
 @router.delete("/credentials/{credential_id}", status_code=204)
 def delete_credential(credential_id: str) -> Response:
-    if not store.delete_credential(credential_id):
+    try:
+        deleted = store.delete_credential(credential_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not deleted:
         raise HTTPException(status_code=404, detail="凭据不存在")
     return Response(status_code=204)
 
@@ -205,8 +211,11 @@ def patch_model_configuration(model_id: str, payload: ModelConfigurationPatch) -
 
 @router.delete("/model-configurations/{model_id}", status_code=204)
 def delete_model_configuration(model_id: str) -> Response:
-    if not store.delete_model_configuration(model_id):
-        raise HTTPException(status_code=404, detail="模型配置不存在")
+    try:
+        if not store.delete_model_configuration(model_id):
+            raise HTTPException(status_code=404, detail="模型配置不存在")
+    except ConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return Response(status_code=204)
 
 
@@ -220,7 +229,10 @@ def enable_model_configuration(model_id: str) -> ModelConfigurationRead:
 
 @router.post("/model-configurations/{model_id}/disable", response_model=ModelConfigurationRead)
 def disable_model_configuration(model_id: str) -> ModelConfigurationRead:
-    model = store.set_model_enabled(model_id, False)
+    try:
+        model = store.set_model_enabled(model_id, False)
+    except ConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     if not model:
         raise HTTPException(status_code=404, detail="模型配置不存在")
     return model
@@ -263,6 +275,27 @@ def publish_skill_package(skill_id: str) -> SkillPackageRead:
     if not skill:
         raise HTTPException(status_code=404, detail="技能包不存在")
     return skill
+
+
+@router.post("/skill-packages/{skill_id}/unpublish", response_model=SkillPackageRead)
+def unpublish_skill_package(skill_id: str) -> SkillPackageRead:
+    try:
+        skill = store.unpublish_skill_package(skill_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not skill:
+        raise HTTPException(status_code=404, detail="技能包不存在")
+    return skill
+
+
+@router.delete("/skill-packages/{skill_id}", status_code=204)
+def delete_skill_package(skill_id: str):
+    try:
+        deleted = store.delete_skill_package(skill_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not deleted:
+        raise HTTPException(status_code=404, detail="技能包不存在")
 
 
 @router.put("/job-template-versions/{version_id}/skill-bindings", response_model=TemplateSkillBindingRead)
@@ -685,9 +718,12 @@ def patch_job_template_version(version_id: str, payload: JobTemplateVersionPatch
 
 @router.post("/job-template-versions/{version_id}/publish", response_model=JobTemplateVersionRead)
 def publish_job_template_version(version_id: str) -> JobTemplateVersionRead:
-    version = store.set_job_template_version_status(version_id, "published")
+    version = store.get_job_template_version(version_id)
     if not version:
         raise HTTPException(status_code=404, detail="岗位模板版本不存在")
+    if version.evaluation.status != "passed":
+        raise HTTPException(status_code=409, detail="岗位模板版本必须先通过模板评测才能发布")
+    version = store.set_job_template_version_status(version_id, "published")
     return version
 
 
@@ -697,6 +733,16 @@ def archive_job_template_version(version_id: str) -> JobTemplateVersionRead:
     if not version:
         raise HTTPException(status_code=404, detail="岗位模板版本不存在")
     return version
+
+
+@router.delete("/job-template-versions/{version_id}", status_code=204)
+def delete_job_template_version(version_id: str) -> None:
+    try:
+        deleted = store.delete_job_template_version(version_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not deleted:
+        raise HTTPException(status_code=404, detail="岗位模板版本不存在")
 
 
 @router.get("/job-template-versions/{version_id}/evaluation", response_model=JobTemplateEvaluationRead)
@@ -713,6 +759,12 @@ def update_template_evaluation(version_id: str, payload: JobTemplateEvaluationUp
     if not evaluation:
         raise HTTPException(status_code=404, detail="岗位模板版本不存在")
     return evaluation
+
+
+@router.post("/job-template-versions/{version_id}/evaluation/run", response_model=TemplateEvaluationRunResponse)
+def run_template_evaluation(version_id: str, payload: TemplateEvaluationRunRequest) -> TemplateEvaluationRunResponse:
+    result = store.run_template_evaluation(version_id, payload.task_description)
+    return TemplateEvaluationRunResponse(**result)
 
 
 @router.get("/digital-employees", response_model=list[DigitalEmployeeRead])

@@ -17,8 +17,24 @@ Platform 的异步执行进程，消费队列任务并执行员工上岗、Herme
 _Avoid_: frontend job, Hermes process
 
 **Runtime Manager（运行时管理器）**:
-Platform 内负责 Hermes Profile 和 Hermes Instance 生命周期的模块。它创建独立测试 Profile、分配端口、启动或停止 Hermes Instance、执行健康检查，并把运行时状态回写到 Digital Employee。
+Platform 内负责 Hermes Profile 和 Hermes Instance 生命周期的模块。它通过 `HermesDashboardClient` 调用 Hermes Dashboard API（默认 9119 端口）创建/删除独立 Profile、写入 SOUL.md、设置模型、启动/停止 Gateway，并通过健康检查轮询确认 Gateway 就绪。每个 Digital Employee 对应一个持久 Profile，评测流程创建临时 Profile 并在完成后清理。
 _Avoid_: manual shell script, user default Hermes profile
+
+**Hermes Profile（Hermes 配置档案）**:
+Hermes Agent 的独立配置目录（`~/.hermes/profiles/<name>/`），包含 `config.yaml`、`SOUL.md`、skills、sessions 等完整运行时状态。每个 Digital Employee 对应一个 Hermes Profile，评测流程中临时 Profile 命名格式为 `eval-<version_id>-<timestamp>`。
+_Avoid_: user account, agent config
+
+**Hermes Gateway（Hermes 网关）**:
+Hermes Agent 的运行时进程，监听指定端口提供 `/v1/runs` API。每个 Gateway 绑定一个 Profile。Platform 通过 `HermesDashboardClient.start_gateway(profile)` 启动、`stop_gateway(profile)` 停止。评测期间为临时 Profile 启动独立 Gateway，端口由 PortPool 分配（默认 8100-8199）。
+_Avoid_: Hermes server, agent process
+
+**PortPool（端口池）**:
+Platform 内管理评测临时 Gateway 端口分配的工具类（`app/runtime/port_pool.py`）。线程安全，支持 allocate/release/available_count。端口耗尽时抛出 RuntimeError 并提示等待。
+_Avoid_: hardcoded port, random port
+
+**HermesDashboardClient（Hermes 控制台客户端）**:
+封装 Hermes Dashboard REST API（默认 9119 端口）的 Python 客户端（`app/integrations/hermes.py`），提供 Profile CRUD、SOUL.md 读写、模型设置和 Gateway 启停等方法。与 `HermesClient`（Run 执行）分工明确。
+_Avoid_: direct subprocess call, raw HTTP
 
 **Platform Development Middleware（平台开发中间件）**:
 本项目开发环境专用的 PostgreSQL、Redis 和 MinIO/S3 兼容对象存储实例。它们不能隐式复用其他项目或 RAGFlow 自带依赖；RAGFlow 作为外部知识库服务接入。
@@ -41,11 +57,12 @@ Job Template 发布时形成的不可变配置快照。草稿修改不会影响 
 _Avoid_: template draft, template revision
 
 **Template Evaluation（模板评测）**:
-针对某个 Job Template Version 的上线前评测。它验证模板的人设、Skill、知识源、工具权限、风险等级和边界行为是否符合预期。创建 Digital Employee 时只能选择已发布且 Template Evaluation 通过的 Job Template Version；未运行、运行中或失败的版本都不能用于创建员工。
+针对某个 Job Template Version 的上线前评测。评测通过创建临时 Hermes Profile、写入 SOUL.md（system_prompt + skills + tools + knowledge_sources + red_lines）、启动独立 Gateway、执行评测任务、收集 Hermes 输出、清理临时资源的全流程完成。创建 Digital Employee 时只能选择已发布且 Template Evaluation 通过的 Job Template Version；未运行、运行中或失败的版本都不能用于创建员工。
+实现位置：`services.py:run_template_evaluation`，依赖 `HermesDashboardClient`（Profile/Gateway 管理）和 `PortPool`（端口分配）。
 _Avoid_: employee test set, manual demo
 
 **Template Evaluation Run（模板评测运行）**:
-对某个 Job Template Version 执行一次评测计划的记录。MVP 中评测计划由一组用例、期望结果、实际结果、人工 pass/fail、失败原因和关键断言记录组成，可覆盖正常问题、模糊问题、无数据、越权请求、Prompt Injection、Tool 审批、知识源失联、预算超限等场景。MVP 不要求自动调用 Hermes 执行评测用例；自动评测、版本对比和回归测试属于后续阶段。`未运行` 只表示该版本还没有产生任何评测运行结果，是模板评测管理状态，不是可创建员工的状态。
+对某个 Job Template Version 执行一次评测计划的记录。MVP 中评测由管理员输入任务描述，系统创建临时 Hermes 环境执行，管理员查看 Hermes 输出后人工标记 pass/fail。评测结果记录在 `JobTemplateEvaluationRead` 中（status、score、summary、cases）。同一模板版本同时只能有一个评测运行（模板级并发锁）。
 _Avoid_: employee smoke test, production run
 
 **Pilot Job Template（试点岗位模板）**:

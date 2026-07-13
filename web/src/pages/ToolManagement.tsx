@@ -109,7 +109,7 @@ const platformApiOptions = [
 ];
 
 export default function ToolManagement() {
-  const { tools, credentials, auditEvents, source, refresh } = usePlatformData();
+  const { tools, credentials, auditEvents, source, refreshTools, refreshCredentials } = usePlatformData();
   const [selectedTool, setSelectedTool] = useState<ToolDefinition | null>(null);
   const [editingTool, setEditingTool] = useState<ToolDefinition | null>(null);
   const [editingCredential, setEditingCredential] = useState<CredentialRecord | null>(null);
@@ -240,7 +240,7 @@ export default function ToolManagement() {
         if (values.status === 'published') {
           await api.post(`/tools/${created.id}/publish`);
         }
-        await refresh();
+        await refreshTools();
         setToolOpen(false);
         setEditingTool(null);
         toolForm.resetFields();
@@ -264,7 +264,7 @@ export default function ToolManagement() {
           idempotency_policy: String(values.idempotencyPolicy ?? '').trim(),
           lifecycle_status: values.status === 'published' ? 'published' : 'draft',
         });
-      await refresh();
+      await refreshTools();
       setToolOpen(false);
       setEditingTool(null);
       toolForm.resetFields();
@@ -274,7 +274,7 @@ export default function ToolManagement() {
   const testConnection = async (tool: ToolDefinition) => {
     const tested = await api.post<Parameters<typeof mapTool>[0]>(`/tools/${tool.toolId}/test`);
     setTestTool(mapTool(tested));
-    await refresh();
+    // 测试是只读操作，无需全量刷新数据
     setTestOpen(true);
   };
 
@@ -286,13 +286,13 @@ export default function ToolManagement() {
     } else {
       await api.post(`/tools/${toolId}/publish`);
     }
-    await refresh();
+    await refreshTools();
   };
 
   const handleDeleteTool = async (toolId: string) => {
     await api.delete(`/tools/${toolId}`);
     message.success('工具已删除');
-    await refresh();
+    await refreshTools();
   };
 
   const openCredential = (credential?: CredentialRecord) => {
@@ -323,7 +323,7 @@ export default function ToolManagement() {
       } else {
         await api.post('/credentials', payload);
       }
-      await refresh();
+      await refreshCredentials();
       setCredentialOpen(false);
       setEditingCredential(null);
       credentialForm.resetFields();
@@ -343,10 +343,29 @@ export default function ToolManagement() {
       await api.patch(`/credentials/${rotatingCredential.credentialId}`, {
         secret_value: values.secretValue,
       });
-      await refresh();
+      await refreshCredentials();
       setRotatingCredential(null);
       rotationForm.resetFields();
     });
+  };
+
+  const handleDeleteCredential = async (credentialId: string, credentialName: string) => {
+    try {
+      await api.delete(`/credentials/${credentialId}`);
+      message.success(`凭证「${credentialName}」已删除`);
+      await refreshCredentials();
+    } catch (err: unknown) {
+      const detail = (err as Error)?.message;
+      if (detail) {
+        Modal.error({
+          title: '无法删除凭证',
+          content: detail,
+          width: 520,
+        });
+      } else {
+        message.error('删除凭证失败');
+      }
+    }
   };
 
   const toolColumns = [
@@ -479,6 +498,16 @@ export default function ToolManagement() {
         <Space size="small">
           <Button size="small" icon={<EditOutlined />} onClick={() => openCredential(row)}>编辑</Button>
           <Button size="small" icon={<ReloadOutlined />} onClick={() => rotateCredential(row.credentialId)}>轮换</Button>
+          <Popconfirm
+            title="确认删除"
+            description={`确定要删除凭证「${row.name}」吗？如果凭证已被工具引用则无法直接删除。`}
+            onConfirm={() => handleDeleteCredential(row.credentialId, row.name)}
+            okText="删除"
+            cancelText="取消"
+            okButtonProps={{ danger: true }}
+          >
+            <Button size="small" danger icon={<DeleteOutlined />} />
+          </Popconfirm>
         </Space>
       ),
     },

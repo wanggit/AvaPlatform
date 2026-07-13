@@ -216,7 +216,7 @@ class ModelConfiguration(Base):
     model_type: Mapped[str] = mapped_column(String(40), nullable=False)
     provider: Mapped[str] = mapped_column(String(80), nullable=False)
     base_url: Mapped[str] = mapped_column(String(1000), nullable=False)
-    credential_id: Mapped[str] = mapped_column(ForeignKey("credentials.id"), nullable=False)
+    api_key: Mapped[str] = mapped_column(String(500), nullable=False)
     model_name: Mapped[str] = mapped_column(String(200), nullable=False)
     context_window: Mapped[int] = mapped_column(Integer, nullable=False)
     max_output_tokens: Mapped[int | None] = mapped_column(Integer)

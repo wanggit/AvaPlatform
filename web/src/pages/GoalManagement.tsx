@@ -79,7 +79,7 @@ function budgetPercent(goal: Goal) {
 
 export default function GoalManagement() {
   const navigate = useNavigate();
-  const { goals, employees, templates, refresh, source } = usePlatformData();
+  const { goals, employees, templates, refreshGoals, source } = usePlatformData();
   const [createOpen, setCreateOpen] = useState(false);
   const [detailOpen, setDetailOpen] = useState(false);
   const [selectedGoal, setSelectedGoal] = useState<Goal | null>(null);
@@ -117,7 +117,7 @@ export default function GoalManagement() {
         ownerTemplateId: owner?.templateId,
         defaultBudgetTokens: template?.defaultGoalBudgetTokens,
       }));
-      await refresh();
+      await refreshGoals();
       setCreateOpen(false);
       form.resetFields();
     });

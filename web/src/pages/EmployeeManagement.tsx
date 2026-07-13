@@ -109,7 +109,7 @@ function rolloutSteps(employee: DigitalEmployee) {
 
 export default function EmployeeManagement() {
   const [messageApi, contextHolder] = message.useMessage();
-  const { employees: data, templates, departments, refresh, source } = usePlatformData();
+  const { employees: data, templates, departments, refreshEmployees, source } = usePlatformData();
   const [createOpen, setCreateOpen] = useState(false);
   const [detailOpen, setDetailOpen] = useState(false);
   const [selectedEmployeeId, setSelectedEmployeeId] = useState<string | null>(null);
@@ -149,7 +149,7 @@ export default function EmployeeManagement() {
   const activateEmployee = async (id: string) => {
     try {
       await api.post(`/digital-employees/${id}/activate`);
-      await refresh();
+      await refreshEmployees();
       messageApi.success('已上岗。系统会先确认 Hermes 实例健康，再允许调度目标。');
     } catch (err) {
       messageApi.error(err instanceof Error ? err.message : '员工上岗失败');
@@ -159,7 +159,7 @@ export default function EmployeeManagement() {
   const disableEmployee = async (id: string) => {
     try {
       await api.post(`/digital-employees/${id}/disable`);
-      await refresh();
+      await refreshEmployees();
       messageApi.info('已停用，控制面仍可查看历史记录和审计。');
     } catch (err) {
       messageApi.error(err instanceof Error ? err.message : '员工停用失败');
@@ -168,7 +168,7 @@ export default function EmployeeManagement() {
 
   const rerunSmokeTest = async (id: string) => {
     await api.post(`/digital-employees/${id}/smoke-test`);
-    await refresh();
+    await refreshEmployees();
     messageApi.success('冒烟测试已重新执行并通过，员工进入待上岗。');
   };
 
@@ -182,7 +182,7 @@ export default function EmployeeManagement() {
   const createEmployee = () => {
     form.validateFields().then(async (values) => {
       await api.post('/digital-employees', buildCreateDigitalEmployeePayload(values));
-      await refresh();
+      await refreshEmployees();
       setCreateOpen(false);
       form.resetFields();
       messageApi.success('已创建员工记录，后台 Rollout Job 正在异步配置。');

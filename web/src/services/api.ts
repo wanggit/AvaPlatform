@@ -44,8 +44,8 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
-  get: <T>(path: string) => request<T>(path),
-  post: <T>(path: string, body?: unknown) => request<T>(path, { method: 'POST', body: body === undefined ? undefined : JSON.stringify(body) }),
+  get: <T>(path: string, init?: RequestInit) => request<T>(path, init),
+  post: <T>(path: string, body?: unknown, init?: RequestInit) => request<T>(path, { method: 'POST', body: body === undefined ? undefined : JSON.stringify(body), ...init }),
   patch: <T>(path: string, body: unknown) => request<T>(path, { method: 'PATCH', body: JSON.stringify(body) }),
   put: <T>(path: string, body: unknown) => request<T>(path, { method: 'PUT', body: JSON.stringify(body) }),
   delete: <T>(path: string) => request<T>(path, { method: 'DELETE' }),
@@ -313,7 +313,7 @@ type BackendModel = {
   model_type: string;
   provider: string;
   base_url: string;
-  api_key_credential_id: string;
+  api_key: string;
   model_name: string;
   context_window: number;
   enabled: boolean;
@@ -328,20 +328,20 @@ export function mapModel(model: BackendModel): ModelConfig {
     provider: model.provider,
     modelName: model.model_name,
     baseUrl: model.base_url,
-    apiKey: model.api_key_credential_id,
+    apiKey: model.api_key,
     contextWindow: model.context_window,
     status: model.enabled ? 'active' : 'disabled',
     description: model.last_test_message ?? '来自 Platform 后端模型配置。',
   };
 }
 
-export function modelPayload(model: Partial<ModelConfig> & Pick<ModelConfig, 'name' | 'type' | 'provider' | 'baseUrl' | 'modelName' | 'contextWindow'>, credentialId: string) {
+export function modelPayload(model: Partial<ModelConfig> & Pick<ModelConfig, 'name' | 'type' | 'provider' | 'baseUrl' | 'modelName' | 'contextWindow'>) {
   return {
     name: model.name,
     model_type: modelTypeToBackend[model.type],
     provider: model.provider,
     base_url: model.baseUrl,
-    api_key_credential_id: credentialId,
+    api_key: model.apiKey ?? '',
     model_name: model.modelName,
     context_window: model.contextWindow,
     enabled: model.status !== 'disabled',

@@ -23,6 +23,11 @@ class Settings(BaseSettings):
     default_llm_context_window: int = 128_000
     hermes_base_url: str = "http://127.0.0.1:8642"
     hermes_api_key: str = ""
+    hermes_dashboard_url: str = "http://127.0.0.1:9119"
+    eval_port_range_start: int = 8100
+    eval_port_range_end: int = 8199
+    eval_gateway_start_timeout_seconds: float = 60.0
+    eval_run_timeout_seconds: float = 300.0
 
     model_config = SettingsConfigDict(env_prefix="AI_PLATFORM_", env_file=".env", extra="ignore")
 

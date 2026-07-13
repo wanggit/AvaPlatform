@@ -61,4 +61,24 @@ def create_runtime_support_tables() -> None:
             )
             """
         )
+        # Backfill columns that may be missing from tables created before the ORM model was updated.
+        connection.execute(
+            """
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'model_configurations' AND column_name = 'api_key'
+                ) THEN
+                    ALTER TABLE model_configurations ADD COLUMN api_key varchar(500) NOT NULL DEFAULT '';
+                END IF;
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'model_configurations' AND column_name = 'max_output_tokens'
+                ) THEN
+                    ALTER TABLE model_configurations ADD COLUMN max_output_tokens integer;
+                END IF;
+            END $$;
+            """
+        )
         connection.commit()

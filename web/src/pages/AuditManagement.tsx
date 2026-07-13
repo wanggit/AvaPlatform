@@ -85,7 +85,8 @@ export default function AuditManagement() {
     auditNotifications,
     employees,
     source,
-    refresh,
+    refreshAuditEvents,
+    refreshAuditRules,
   } = usePlatformData();
   const [selectedEvent, setSelectedEvent] = useState<AuditEvent | null>(null);
   const [editingRule, setEditingRule] = useState<AuditRule | null>(null);
@@ -155,7 +156,7 @@ export default function AuditManagement() {
           escalation_policy: values.notify ? '进入审批中心并通知接收人' : undefined,
           retention_days: values.retentionDays === 'permanent' ? 3650 : values.retentionDays,
         });
-        await refresh();
+        await refreshAuditRules();
         setActiveTab('rules');
         setRuleOpen(false);
         ruleForm.resetFields();
@@ -171,7 +172,7 @@ export default function AuditManagement() {
         retention_days: values.retentionDays === 'permanent' ? 3650 : values.retentionDays,
         enabled: values.enabled ?? true,
       });
-      await refresh();
+      await refreshAuditRules();
       setActiveTab('rules');
       setRuleOpen(false);
       setEditingRule(null);
@@ -183,7 +184,7 @@ export default function AuditManagement() {
     const rule = rules.find((item) => item.id === ruleId);
     if (!rule) return;
     await api.patch(`/audit/rules/${ruleId}`, { enabled: !rule.enabled });
-    await refresh();
+    await refreshAuditRules();
   };
 
   const saveDisposition = () => {
@@ -194,7 +195,7 @@ export default function AuditManagement() {
         note: values.note,
         reviewer: '管理员',
       });
-      await refresh();
+      await refreshAuditEvents();
       setSelectedEvent(null);
       setDispositionOpen(false);
       dispositionForm.resetFields();
@@ -212,7 +213,7 @@ export default function AuditManagement() {
           reason: values.reason || 'masked export',
         },
       });
-      await refresh();
+      await refreshAuditEvents();
       setExportOpen(false);
       exportForm.resetFields();
     });

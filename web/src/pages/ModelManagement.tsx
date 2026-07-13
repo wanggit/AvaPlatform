@@ -1,7 +1,7 @@
 // 模型配置页面：维护大语言模型、向量模型、排序模型等模型连接信息。
 import { useState } from 'react';
-import { Badge, Button, Col, Descriptions, Form, Input, InputNumber, Modal, Row, Select, Space, Table, Tag, Typography, message } from 'antd';
-import { EditOutlined, EyeOutlined, PlusOutlined, PoweroffOutlined } from '@ant-design/icons';
+import { Badge, Button, Col, Descriptions, Form, Input, InputNumber, Modal, Popconfirm, Row, Select, Space, Table, Tag, Typography, message } from 'antd';
+import { DeleteOutlined, EditOutlined, EyeOutlined, ApiOutlined, PlusOutlined, PoweroffOutlined } from '@ant-design/icons';
 import { modelTypeLabelMap, type ModelConfig, type ModelType } from '../types/domain';
 import { api, modelPayload } from '../services/api';
 import { usePlatformData } from '../services/platformData';
@@ -27,12 +27,13 @@ const providerOptions = [
 ];
 
 export default function ModelManagement() {
-  const { models, refresh, source } = usePlatformData();
+  const { models, refreshModels, source } = usePlatformData();
   const [messageApi, contextHolder] = message.useMessage();
   const [editOpen, setEditOpen] = useState(false);
   const [detailOpen, setDetailOpen] = useState(false);
   const [editingModel, setEditingModel] = useState<ModelConfig | null>(null);
   const [selectedModel, setSelectedModel] = useState<ModelConfig | null>(null);
+  const [testingId, setTestingId] = useState<string | null>(null);
   const [form] = Form.useForm();
 
   const openCreate = () => {
@@ -57,21 +58,12 @@ export default function ModelManagement() {
   const saveModel = () => {
     form.validateFields().then(async (values) => {
       if (editingModel) {
-        const credentialId = values.apiKey?.startsWith('cred-') ? values.apiKey : editingModel.apiKey;
-        await api.patch(`/model-configurations/${editingModel.id}`, modelPayload(values, credentialId));
-        await refresh();
+        await api.patch(`/model-configurations/${editingModel.id}`, modelPayload(values));
+        await refreshModels();
         messageApi.success('模型配置已保存到后端。');
       } else {
-        const credential = await api.post<{ id: string }>('/credentials', {
-          name: `${values.name} 接口密钥`,
-          owner_type: 'platform',
-          owner_id: 'platform',
-          owner_name: 'Platform',
-          secret_value: values.apiKey,
-          description: `${values.name} 模型配置使用的接口密钥。`,
-        });
-        await api.post('/model-configurations', modelPayload(values, credential.id));
-        await refresh();
+        await api.post('/model-configurations', modelPayload(values));
+        await refreshModels();
         messageApi.success('模型配置已创建到后端。');
       }
       setEditOpen(false);
@@ -86,10 +78,37 @@ export default function ModelManagement() {
   const toggleStatus = async (model: ModelConfig) => {
     try {
       await api.post(`/model-configurations/${model.id}/${model.status === 'active' ? 'disable' : 'enable'}`);
-      await refresh();
+      await refreshModels();
       messageApi.success(model.status === 'active' ? '模型已停用。' : '模型已启用。');
     } catch (err) {
       messageApi.error(err instanceof Error ? err.message : '模型启停失败');
+    }
+  };
+
+  const handleDelete = async (model: ModelConfig) => {
+    try {
+      await api.delete(`/model-configurations/${model.id}`);
+      await refreshModels();
+      messageApi.success('模型已删除。');
+    } catch (err) {
+      messageApi.error(err instanceof Error ? err.message : '删除模型失败');
+    }
+  };
+
+  const handleTest = async (model: ModelConfig) => {
+    setTestingId(model.id);
+    try {
+      const result = await api.post<{ status: string; message: string }>(`/model-configurations/${model.id}/test`);
+      // 测试是只读操作，无需刷新数据
+      if (result.status === 'passed') {
+        messageApi.success(result.message);
+      } else {
+        messageApi.error(result.message);
+      }
+    } catch (err) {
+      messageApi.error(err instanceof Error ? err.message : '模型连通性测试失败');
+    } finally {
+      setTestingId(null);
     }
   };
 
@@ -139,14 +158,34 @@ export default function ModelManagement() {
     {
       title: '操作',
       key: 'action',
-      width: 210,
+      width: 350,
       render: (_: unknown, row: ModelConfig) => (
         <Space size="small">
           <Button size="small" icon={<EyeOutlined />} onClick={() => { setSelectedModel(row); setDetailOpen(true); }}>详情</Button>
           <Button size="small" icon={<EditOutlined />} onClick={() => openEdit(row)}>编辑</Button>
+          <Button
+            size="small"
+            icon={<ApiOutlined />}
+            loading={testingId === row.id}
+            onClick={() => handleTest(row)}
+          >
+            测试
+          </Button>
           <Button size="small" icon={<PoweroffOutlined />} onClick={() => toggleStatus(row)}>
             {row.status === 'active' ? '停用' : '启用'}
           </Button>
+          {row.status === 'disabled' && (
+            <Popconfirm
+              title="确认删除"
+              description="确定要删除该模型配置吗？此操作不可撤销。"
+              onConfirm={() => handleDelete(row)}
+              okText="删除"
+              cancelText="取消"
+              okButtonProps={{ danger: true }}
+            >
+              <Button size="small" danger icon={<DeleteOutlined />}>删除</Button>
+            </Popconfirm>
+          )}
         </Space>
       ),
     },

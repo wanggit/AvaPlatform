@@ -9,7 +9,7 @@ import { api } from '../services/api';
 const { Text, Title } = Typography;
 
 export default function DepartmentManagement() {
-  const { departments, refresh, source } = usePlatformData();
+  const { departments, refreshDepartments, source } = usePlatformData();
   const [createOpen, setCreateOpen] = useState(false);
   const [editOpen, setEditOpen] = useState(false);
   const [editingDept, setEditingDept] = useState<Department | null>(null);
@@ -19,7 +19,7 @@ export default function DepartmentManagement() {
   const handleCreate = () => {
     form.validateFields().then(async (values) => {
       await api.post('/departments', values);
-      await refresh();
+      await refreshDepartments();
       setCreateOpen(false);
       form.resetFields();
     });
@@ -29,7 +29,7 @@ export default function DepartmentManagement() {
     editForm.validateFields().then(async (values) => {
       if (!editingDept) return;
       await api.patch(`/departments/${editingDept.id}`, values);
-      await refresh();
+      await refreshDepartments();
       setEditOpen(false);
       setEditingDept(null);
     });
@@ -37,7 +37,7 @@ export default function DepartmentManagement() {
 
   const handleDelete = async (id: string) => {
     await api.delete(`/departments/${id}`);
-    await refresh();
+    await refreshDepartments();
   };
 
   const columns = [

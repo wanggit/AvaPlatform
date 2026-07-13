@@ -31,27 +31,19 @@ def test_model_configuration_uses_platform_credential_and_selection_filter(monke
 
     monkeypatch.setattr("app.services.httpx.get", fake_get)
     api = client()
-    credential = api.post("/api/v1/credentials", json={
-        "name": "Ollama Embedding",
-        "owner_type": "platform",
-        "owner_id": "platform",
-        "owner_name": "Platform",
-        "secret_value": "local-dev-secret",
-    }).json()
 
     response = api.post("/api/v1/model-configurations", json={
         "name": "本地向量模型",
         "model_type": "embedding_model",
         "provider": "ollama",
         "base_url": "http://127.0.0.1:11434",
-        "api_key_credential_id": credential["id"],
+        "api_key": "local-dev-secret",
         "model_name": "nomic-embed-text",
         "context_window": 8192,
     })
 
     assert response.status_code == 201
     model_id = response.json()["id"]
-    assert "secret_value" not in credential
 
     assert api.post(f"/api/v1/model-configurations/{model_id}/test").json()["status"] == "passed"
     assert len(api.get("/api/v1/model-configurations?enabled=true&model_type=embedding_model").json()) == 1
@@ -62,19 +54,12 @@ def test_model_configuration_uses_platform_credential_and_selection_filter(monke
 
 def test_model_configuration_accepts_frontend_type_aliases() -> None:
     api = client()
-    credential = api.post("/api/v1/credentials", json={
-        "name": "OpenAI 兼容密钥",
-        "owner_type": "platform",
-        "owner_id": "platform",
-        "owner_name": "Platform",
-        "secret_value": "dev-secret",
-    }).json()
 
     defaulted = api.post("/api/v1/model-configurations", json={
         "name": "默认大模型",
         "provider": "OpenAI Compatible",
         "base_url": "https://example.com/v1",
-        "api_key_credential_id": credential["id"],
+        "api_key": "dev-secret",
         "model_name": "demo-chat",
         "context_window": 8192,
     })
@@ -86,7 +71,7 @@ def test_model_configuration_accepts_frontend_type_aliases() -> None:
         "type": "embedding",
         "provider": "OpenAI Compatible",
         "base_url": "https://example.com/v1",
-        "api_key_credential_id": credential["id"],
+        "api_key": "dev-secret",
         "model_name": "demo-embedding",
         "context_window": 8192,
     })

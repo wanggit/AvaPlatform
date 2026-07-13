@@ -11,6 +11,7 @@ import {
   Input,
   InputNumber,
   Modal,
+  Popconfirm,
   Progress,
   Row,
   Select,
@@ -23,7 +24,9 @@ import {
 } from 'antd';
 import {
   CheckCircleOutlined,
+  DeleteOutlined,
   EditOutlined,
+  ExperimentOutlined,
   EyeOutlined,
   MinusCircleOutlined,
   PlusOutlined,
@@ -110,13 +113,21 @@ const defaultValues = {
 };
 
 export default function TemplateManagement() {
-  const { templates, models, skills, tools, knowledgeSources, departments, refresh, source } = usePlatformData();
+  const { templates, models, skills, tools, knowledgeSources, departments, refreshTemplates, source } = usePlatformData();
   const [messageApi, contextHolder] = message.useMessage();
   const [open, setOpen] = useState(false);
   const [detailOpen, setDetailOpen] = useState(false);
   const [selectedTemplate, setSelectedTemplate] = useState<JobTemplate | null>(null);
   const [editingTemplate, setEditingTemplate] = useState<JobTemplate | null>(null);
   const [form] = Form.useForm();
+
+  // 评测相关状态
+  const [evalOpen, setEvalOpen] = useState(false);
+  const [evalRunning, setEvalRunning] = useState(false);
+  const [evalTaskDescription, setEvalTaskDescription] = useState('');
+  const [evalResult, setEvalResult] = useState<{ runId: string; hermesOutput: string; status: string; errorMessage?: string } | null>(null);
+  const [evalJudgment, setEvalJudgment] = useState<'passed' | 'failed'>('passed');
+  const [evalSummary, setEvalSummary] = useState('');
 
   const modelNameById = useMemo(() => (
     models.reduce<Record<string, string>>((acc, model) => {
@@ -196,7 +207,7 @@ export default function TemplateManagement() {
         await api.post('/job-template-versions', payload);
         messageApi.success('岗位模板草稿已创建到后端。');
       }
-      await refresh();
+      await refreshTemplates();
       setOpen(false);
       setEditingTemplate(null);
       form.resetFields();
@@ -209,10 +220,99 @@ export default function TemplateManagement() {
   const publishTemplate = async (templateId: string) => {
     try {
       await api.post(`/job-template-versions/${templateId}/publish`);
-      await refresh();
+      await refreshTemplates();
       messageApi.success('岗位模板已发布。');
     } catch (err) {
       messageApi.error(err instanceof Error ? err.message : '发布岗位模板失败');
+    }
+  };
+
+  const deleteTemplate = async (templateId: string) => {
+    try {
+      await api.delete(`/job-template-versions/${templateId}`);
+      await refreshTemplates();
+      messageApi.success('岗位模板已删除。');
+    } catch (err) {
+      messageApi.error(err instanceof Error ? err.message : '删除岗位模板失败');
+    }
+  };
+
+  const openEvaluation = (template: JobTemplate) => {
+    setSelectedTemplate(template);
+    setEvalTaskDescription('');
+    setEvalResult(null);
+    setEvalJudgment('passed');
+    setEvalSummary('');
+    setEvalOpen(true);
+  };
+
+  const runEvaluation = async () => {
+    if (!selectedTemplate || !evalTaskDescription.trim()) {
+      messageApi.warning('请输入评测任务描述');
+      return;
+    }
+    setEvalRunning(true);
+    setEvalResult(null);
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 420_000); // 7 分钟超时（Profile 创建 + Gateway 启动 + Run 执行）
+    messageApi.loading({ content: '正在创建评测环境（Profile + Gateway）…', key: 'eval-progress', duration: 0 });
+    try {
+      const result = await api.post<{ run_id: string; task_description: string; hermes_output: string; status: string; error_message?: string }>(
+        `/job-template-versions/${selectedTemplate.id}/evaluation/run`,
+        { task_description: evalTaskDescription },
+        { signal: controller.signal },
+      );
+      messageApi.destroy('eval-progress');
+      setEvalResult({
+        runId: result.run_id,
+        hermesOutput: result.hermes_output,
+        status: result.status,
+        errorMessage: result.error_message,
+      });
+      if (result.status === 'completed') {
+        messageApi.success('评测执行完成，请查看 Hermes 输出并给出评审结论。');
+      } else {
+        messageApi.error(`评测执行失败：${result.error_message || '未知错误'}`);
+      }
+    } catch (err) {
+      messageApi.destroy('eval-progress');
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        messageApi.error('评测执行超时（超过 7 分钟），请尝试简化任务描述后重试。');
+      } else {
+        messageApi.error(err instanceof Error ? err.message : '调用 Hermes 评测失败');
+      }
+    } finally {
+      clearTimeout(timeoutId);
+      setEvalRunning(false);
+    }
+  };
+
+  const submitEvaluation = async () => {
+    if (!selectedTemplate) return;
+    try {
+      const evaluationCase = {
+        id: globalThis.crypto?.randomUUID?.() ?? `eval-case-${Date.now()}`,
+        title: evalTaskDescription,
+        input_payload: { task: evalTaskDescription },
+        expected_result: '',
+        actual_result: evalResult?.hermesOutput ?? '',
+        assertions: [],
+        status: evalJudgment,
+        failure_reason: evalJudgment === 'failed' ? (evalSummary || '人工评审未通过') : null,
+      };
+      const payload = {
+        status: evalJudgment,
+        score: evalJudgment === 'passed' ? 100 : 0,
+        evaluator: '管理员',
+        summary: evalSummary || (evalJudgment === 'passed' ? '人工评审通过。' : '人工评审未通过。'),
+        cases: [evaluationCase],
+      };
+      await api.put(`/job-template-versions/${selectedTemplate.id}/evaluation`, payload);
+      await refreshTemplates();
+      messageApi.success('评测结果已提交。');
+      setEvalOpen(false);
+    } catch (err) {
+      messageApi.error(err instanceof Error ? err.message : '提交评测结果失败');
     }
   };
 
@@ -264,12 +364,23 @@ export default function TemplateManagement() {
     {
       title: '操作',
       key: 'actions',
-      width: 220,
+      width: 280,
       render: (_: unknown, row: JobTemplate) => (
         <Space>
           <Button size="small" icon={<EyeOutlined />} onClick={() => { setSelectedTemplate(row); setDetailOpen(true); }}>详情</Button>
           <Button size="small" icon={<EditOutlined />} onClick={() => openEdit(row)}>编辑</Button>
+          <Button size="small" icon={<ExperimentOutlined />} onClick={() => openEvaluation(row)}>评测</Button>
           {row.status === 'draft' && <Button size="small" type="primary" icon={<SendOutlined />} onClick={() => publishTemplate(row.id)}>发布</Button>}
+          <Popconfirm
+            title="确认删除"
+            description={`确定要删除岗位模板「${row.role} v${row.version}」吗？此操作不可恢复。`}
+            onConfirm={() => deleteTemplate(row.id)}
+            okText="确认删除"
+            cancelText="取消"
+            okButtonProps={{ danger: true }}
+          >
+            <Button size="small" danger icon={<DeleteOutlined />} />
+          </Popconfirm>
         </Space>
       ),
     },
@@ -499,7 +610,12 @@ export default function TemplateManagement() {
         open={detailOpen}
         onCancel={() => setDetailOpen(false)}
         width={940}
-        footer={<Button type="primary" onClick={() => setDetailOpen(false)}>关闭</Button>}
+        footer={
+          <Space>
+            <Button icon={<ExperimentOutlined />} onClick={() => { setDetailOpen(false); openEvaluation(selectedTemplate!); }}>评测</Button>
+            <Button type="primary" onClick={() => setDetailOpen(false)}>关闭</Button>
+          </Space>
+        }
       >
         {selectedTemplate && (
           <Space orientation="vertical" style={{ width: '100%' }} size={16}>
@@ -569,6 +685,115 @@ export default function TemplateManagement() {
             </Space>
           </Space>
         )}
+      </Modal>
+
+      <Modal
+        title={`评测：${selectedTemplate?.role ?? ''}`}
+        open={evalOpen}
+        onCancel={() => { setEvalOpen(false); setEvalResult(null); }}
+        width={800}
+        footer={
+          <Space>
+            <Button onClick={() => { setEvalOpen(false); setEvalResult(null); }}>关闭</Button>
+            {evalResult?.status === 'completed' && (
+              <Button type="primary" onClick={submitEvaluation}>提交评测结果</Button>
+            )}
+          </Space>
+        }
+      >
+        <Space orientation="vertical" style={{ width: '100%' }} size={16}>
+          <Alert
+            type="info"
+            showIcon
+            message="评测将创建临时 Hermes Profile 并启动独立 Gateway，然后执行评测任务。整个过程约需 2-5 分钟，请耐心等待。"
+          />
+
+          <Card size="small" title="评测任务">
+            <Input.TextArea
+              rows={4}
+              placeholder="例如：请帮我分析上个月的销售数据，找出同比增长最快的三个产品线，并给出改进建议。"
+              value={evalTaskDescription}
+              onChange={(e) => setEvalTaskDescription(e.target.value)}
+              disabled={evalRunning || !!evalResult}
+            />
+            <div style={{ marginTop: 12 }}>
+              <Button
+                type="primary"
+                icon={<ExperimentOutlined />}
+                loading={evalRunning}
+                onClick={runEvaluation}
+                disabled={!!evalResult}
+              >
+                执行评测
+              </Button>
+              {evalResult && (
+                <Button style={{ marginLeft: 8 }} onClick={() => { setEvalResult(null); setEvalTaskDescription(''); setEvalJudgment('passed'); setEvalSummary(''); }}>
+                  重新评测
+                </Button>
+              )}
+            </div>
+          </Card>
+
+          {evalResult && (
+            <>
+              <Card
+                size="small"
+                title={evalResult.status === 'completed' ? 'Hermes 执行结果' : '执行失败'}
+                style={{ borderColor: evalResult.status === 'completed' ? '#52c41a' : '#ff4d4f' }}
+              >
+                {evalResult.status === 'error' ? (
+                  <Alert type="error" message={evalResult.errorMessage || '未知错误'} />
+                ) : (
+                  <div style={{
+                    maxHeight: 300,
+                    overflow: 'auto',
+                    background: '#1e1e1e',
+                    color: '#d4d4d4',
+                    padding: 16,
+                    borderRadius: 6,
+                    fontFamily: 'monospace',
+                    fontSize: 13,
+                    whiteSpace: 'pre-wrap',
+                    wordBreak: 'break-word',
+                  }}>
+                    {evalResult.hermesOutput || '(Hermes 未返回输出内容)'}
+                  </div>
+                )}
+                <Text type="secondary" style={{ display: 'block', marginTop: 8 }}>
+                  Run ID: {evalResult.runId || 'N/A'}
+                </Text>
+              </Card>
+
+              {evalResult.status === 'completed' && (
+                <Card size="small" title="人工评审结论">
+                  <Space orientation="vertical" style={{ width: '100%' }}>
+                    <div>
+                      <Text strong style={{ marginRight: 12 }}>评测结论：</Text>
+                      <Select
+                        value={evalJudgment}
+                        onChange={setEvalJudgment}
+                        style={{ width: 120 }}
+                        options={[
+                          { label: '✅ 通过', value: 'passed' },
+                          { label: '❌ 不通过', value: 'failed' },
+                        ]}
+                      />
+                    </div>
+                    <div>
+                      <Text strong style={{ display: 'block', marginBottom: 4 }}>评审说明：</Text>
+                      <Input.TextArea
+                        rows={3}
+                        placeholder="描述评测结论的理由，例如：任务完成度、输出质量、是否触发红线等。"
+                        value={evalSummary}
+                        onChange={(e) => setEvalSummary(e.target.value)}
+                      />
+                    </div>
+                  </Space>
+                </Card>
+              )}
+            </>
+          )}
+        </Space>
       </Modal>
     </>
   );

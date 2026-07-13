@@ -65,7 +65,9 @@ export default function QuotaManagement() {
     templates,
     goals,
     goalBudgetPolicies,
-    refresh,
+    refreshQuota,
+    refreshGoalBudgets,
+    refreshGoals,
     source,
   } = usePlatformData();
   const [editingGoalBudget, setEditingGoalBudget] = useState<GoalBudgetPolicy | null>(null);
@@ -112,7 +114,7 @@ export default function QuotaManagement() {
         warning_threshold_percent: values.warningThresholdPercent,
         over_limit_action: 'block_new_work',
       });
-      await refresh();
+      await refreshQuota();
       setOrgOpen(false);
     });
   };
@@ -132,7 +134,7 @@ export default function QuotaManagement() {
         overage_action: values.overageAction,
         approvers: values.approvers ?? [],
       });
-      await refresh();
+      await refreshGoalBudgets();
       setGoalBudgetOpen(false);
       setEditingGoalBudget(null);
       goalBudgetForm.resetFields();
@@ -141,7 +143,7 @@ export default function QuotaManagement() {
 
   const clearBudgetBlock = async (goalId: string) => {
     await api.post(`/goal-runs/${goalId}/resume`);
-    await refresh();
+    await refreshGoals();
   };
 
   const goalColumns = [
