@@ -5,6 +5,9 @@ import binascii
 import hashlib
 import io
 import json
+import logging
+import re
+import secrets
 import threading
 import time
 import zipfile
@@ -17,6 +20,8 @@ from app.config import settings
 from app.db.relational_state import load_relational_state, save_relational_state
 from app.integrations.hermes import HermesClient, HermesDashboardClient
 from app.runtime.port_pool import PortPool
+
+logger = logging.getLogger(__name__)
 
 
 class ConflictError(ValueError):
@@ -119,6 +124,33 @@ def compute_availability(lifecycle_state: LifecycleStatus, runtime_state: Runtim
     return "busy" if active_goal_count > 0 else "idle"
 
 
+_PROVIDER_API_KEY_ENV_OVERRIDES = {
+    "anthropic": "ANTHROPIC_API_KEY",
+    "deepseek": "DEEPSEEK_API_KEY",
+    "gemini": "GEMINI_API_KEY",
+    "google": "GOOGLE_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
+    "xai": "XAI_API_KEY",
+}
+
+
+def _provider_api_key_env_var(provider: str) -> str:
+    normalized = provider.strip().lower()
+    if not normalized:
+        raise ValueError("模型供应商未配置，无法推导 API Key 环境变量")
+    if normalized in _PROVIDER_API_KEY_ENV_OVERRIDES:
+        return _PROVIDER_API_KEY_ENV_OVERRIDES[normalized]
+    return f"{re.sub(r'[^a-z0-9]+', '_', normalized).strip('_').upper()}_API_KEY"
+
+
+def _log_preview(value: str, limit: int = 500) -> str:
+    compact = " ".join(value.split())
+    if len(compact) <= limit:
+        return compact
+    return f"{compact[:limit]}..."
+
+
 class InMemoryStore:
     def __init__(self) -> None:
         self.reset()
@@ -215,7 +247,7 @@ class InMemoryStore:
         self._eval_locks: dict[str, threading.Lock] = {}
         self._dashboard = HermesDashboardClient(
             settings.hermes_dashboard_url,
-            settings.hermes_api_key,
+            settings.hermes_dashboard_token,
         )
 
     def _audit(self, event_type: str, payload: dict) -> str:
@@ -228,9 +260,6 @@ class InMemoryStore:
         if version_id not in self._eval_locks:
             self._eval_locks[version_id] = threading.Lock()
         return self._eval_locks[version_id]
-        audit_id = new_id("audit")
-        self.audit_events.append(AuditEventRead(id=audit_id, event_type=event_type, payload=payload))
-        return audit_id
 
     def _mask_secret(self, value: str) -> str:
         if len(value) <= 4:
@@ -250,6 +279,23 @@ class InMemoryStore:
         if not credential:
             return None
         return self.secret_values.get(credential.secret_ref)
+
+    def _evaluation_profile_env(self, model_config: ModelConfigurationRead | None) -> dict[str, str]:
+        if model_config:
+            provider = model_config.provider
+            secret = self._credential_secret(model_config.api_key)
+            if secret is None and model_config.api_key not in self.credentials:
+                secret = model_config.api_key or None
+            model_label = model_config.name
+        else:
+            provider = settings.default_llm_provider
+            secret = settings.default_llm_api_key or None
+            model_label = settings.default_llm_name
+
+        if not secret:
+            raise ValueError(f"模型配置「{model_label}」缺少 API Key，无法执行评测。请在模型配置中绑定有效凭据。")
+
+        return {_provider_api_key_env_var(provider): secret}
 
     def _department_with_counts(self, department: DepartmentRead) -> DepartmentRead:
         employee_count = sum(1 for employee in self.employees.values() if employee.department_id == department.id)
@@ -1592,14 +1638,29 @@ class InMemoryStore:
 
         lock = self._eval_lock_for(version_id)
         if not lock.acquire(blocking=False):
+            logger.warning("Template evaluation rejected because another run is active version_id=%s", version_id)
             raise ConflictError("该模板版本正在评测中，请等待当前评测完成后再试。")
 
         port: int | None = None
         profile_name: str | None = None
+        gw_result: dict = {}
+        eval_api_key = settings.hermes_api_key or f"eval-{secrets.token_urlsafe(32)}"
+        logger.info(
+            "Template evaluation requested version_id=%s role=%s task_chars=%s",
+            version_id,
+            version.role,
+            len(task_description),
+        )
         try:
             # 1. 分配端口
             port = self.port_pool.allocate()
             profile_name = f"eval-{version_id[:30]}-{int(time.time())}"
+            logger.info(
+                "Template evaluation profile planning version_id=%s profile=%s port=%s",
+                version_id,
+                profile_name,
+                port,
+            )
 
             self._audit("template_evaluation_profile_creating", {
                 "template_version_id": version_id,
@@ -1611,28 +1672,82 @@ class InMemoryStore:
             model_config = self.model_configurations.get(version.model_config_id)
             provider = model_config.provider if model_config else settings.default_llm_provider
             model = model_config.model_name if model_config else settings.default_llm_model
+            logger.info(
+                "Creating Hermes evaluation profile version_id=%s profile=%s provider=%s model=%s model_config_id=%s",
+                version_id,
+                profile_name,
+                provider,
+                model,
+                version.model_config_id,
+            )
             self._dashboard.create_profile(
                 profile_name,
                 model_provider=provider,
                 model_name=model,
+                no_skills=True,
             )
+            logger.info("Hermes evaluation profile created version_id=%s profile=%s", version_id, profile_name)
 
             # 3. 写入 SOUL.md
             soul_content = self._render_evaluation_soul(version)
+            logger.info(
+                "Writing Hermes evaluation SOUL version_id=%s profile=%s soul_chars=%s",
+                version_id,
+                profile_name,
+                len(soul_content),
+            )
             self._dashboard.write_soul(profile_name, soul_content)
+            logger.info("Hermes evaluation SOUL written version_id=%s profile=%s", version_id, profile_name)
 
-            # 4. 启动 Gateway
-            self._dashboard.start_gateway(profile_name)
+            # 4. 写入 Profile 运行时密钥，Hermes Gateway 启动时会加载该 .env
+            profile_env = self._evaluation_profile_env(model_config)
+            logger.info(
+                "Writing Hermes evaluation profile env version_id=%s profile=%s env_keys=%s",
+                version_id,
+                profile_name,
+                sorted(profile_env.keys()),
+            )
+            self._dashboard.write_profile_env(profile_name, profile_env)
 
-            # 5. 等待 Gateway 就绪
+            # 5. 配置 API Server 端口（新 Profile 默认端口会与主 Gateway 冲突）
+            logger.info(
+                "Configuring Hermes evaluation api_server version_id=%s profile=%s port=%s api_key_configured=%s",
+                version_id,
+                profile_name,
+                port,
+                bool(eval_api_key),
+            )
+            self._dashboard.write_gateway_port(profile_name, port, api_key=eval_api_key)
+
+            # 6. 启动 Gateway
+            gw_result = self._dashboard.start_gateway(profile_name)
+            gw_log = gw_result.get("log", "未知")
+            logger.info(
+                "Hermes evaluation gateway started version_id=%s profile=%s port=%s pid=%s log=%s",
+                version_id,
+                profile_name,
+                port,
+                gw_result.get("pid"),
+                gw_log,
+            )
+
+            # 7. 等待 Gateway 就绪
             ready = self._dashboard.wait_gateway_ready(
                 port,
                 timeout_seconds=settings.eval_gateway_start_timeout_seconds,
             )
             if not ready:
+                logger.warning(
+                    "Hermes evaluation gateway readiness timeout version_id=%s profile=%s port=%s log=%s",
+                    version_id,
+                    profile_name,
+                    port,
+                    gw_log,
+                )
                 raise RuntimeError(
                     f"Gateway 启动超时（{settings.eval_gateway_start_timeout_seconds}s），"
-                    f"端口 {port}，Profile: {profile_name}"
+                    f"端口 {port}，Profile: {profile_name}\n"
+                    f"请查看 Gateway 日志: tail -100 {gw_log}"
                 )
 
             self._audit("template_evaluation_gateway_ready", {
@@ -1641,10 +1756,17 @@ class InMemoryStore:
                 "port": port,
             })
 
-            # 6. 执行评测任务
+            # 8. 执行评测任务
+            logger.info(
+                "Submitting Hermes evaluation run version_id=%s profile=%s port=%s timeout_seconds=%s",
+                version_id,
+                profile_name,
+                port,
+                settings.eval_run_timeout_seconds,
+            )
             hermes = HermesClient(
                 f"http://127.0.0.1:{port}",
-                settings.hermes_api_key,
+                eval_api_key,
                 timeout_seconds=settings.eval_run_timeout_seconds,
             )
             result = hermes.create_and_wait_run(
@@ -1656,6 +1778,24 @@ class InMemoryStore:
             output = result.get("output") or json.dumps(result, ensure_ascii=False)
             run_status = result.get("status", "unknown")
             is_completed = run_status == "completed"
+            if is_completed:
+                logger.info(
+                    "Hermes evaluation run completed version_id=%s profile=%s run_id=%s output_chars=%s",
+                    version_id,
+                    profile_name,
+                    run_id,
+                    len(output),
+                )
+            else:
+                logger.warning(
+                    "Hermes evaluation run ended non-completed version_id=%s profile=%s run_id=%s status=%s output_chars=%s output_preview=%s",
+                    version_id,
+                    profile_name,
+                    run_id,
+                    run_status,
+                    len(output),
+                    _log_preview(output),
+                )
 
             self._audit("template_evaluation_run_completed", {
                 "template_version_id": version_id,
@@ -1670,37 +1810,68 @@ class InMemoryStore:
                 "task_description": task_description,
                 "hermes_output": output,
                 "status": "completed" if is_completed else "error",
-                "error_message": None if is_completed else f"Hermes 运行状态: {run_status}",
+                "error_message": None if is_completed else f"Hermes 运行状态: {run_status}\n{output}",
             }
 
         except (httpx.HTTPError, ValueError, RuntimeError) as exc:
+            error_msg = str(exc)
+            # 提供更友好的错误提示
+            if "Connection refused" in error_msg or "ConnectionError" in error_msg:
+                error_msg = (
+                    f"无法连接 Hermes Dashboard（{settings.hermes_dashboard_url}），"
+                    f"请确保已启动 Dashboard：./platform-dev.sh start\n"
+                    f"原始错误: {error_msg}"
+                )
+            logger.exception(
+                "Template evaluation failed version_id=%s profile=%s port=%s error=%s",
+                version_id,
+                profile_name,
+                port,
+                _log_preview(error_msg),
+            )
             self._audit("template_evaluation_run_failed", {
                 "template_version_id": version_id,
                 "profile_name": profile_name,
                 "port": port,
-                "error": str(exc),
+                "error": error_msg,
             })
             return {
                 "run_id": "",
                 "task_description": task_description,
                 "hermes_output": "",
                 "status": "error",
-                "error_message": str(exc),
+                "error_message": error_msg,
             }
         finally:
             # 清理顺序：Gateway → Profile → Port
             if profile_name:
                 try:
-                    self._dashboard.stop_gateway(profile_name)
-                except Exception:
-                    pass
+                    stopped_spawned = self._dashboard.stop_spawned_gateway(profile_name, gw_result.get("pid"))
+                    logger.info(
+                        "Hermes evaluation spawned gateway cleanup profile=%s pid=%s stopped=%s",
+                        profile_name,
+                        gw_result.get("pid"),
+                        stopped_spawned,
+                    )
+                except Exception as exc:
+                    logger.warning("Hermes evaluation spawned gateway cleanup failed profile=%s error=%s", profile_name, exc)
                 try:
-                    self._dashboard.delete_profile(profile_name)
-                except Exception:
-                    pass
+                    stop_result = self._dashboard.stop_gateway(profile_name)
+                    logger.info("Hermes evaluation dashboard gateway cleanup profile=%s result=%s", profile_name, stop_result)
+                except Exception as exc:
+                    logger.info("Hermes evaluation dashboard gateway cleanup skipped/failed profile=%s error=%s", profile_name, exc)
+                try:
+                    delete_result = self._dashboard.delete_profile(profile_name)
+                    logger.info("Hermes evaluation profile deleted profile=%s result=%s", profile_name, delete_result)
+                except Exception as exc:
+                    logger.warning("Hermes evaluation profile delete failed profile=%s error=%s", profile_name, exc)
             if port is not None:
                 self.port_pool.release(port)
+                logger.info("Hermes evaluation port released version_id=%s profile=%s port=%s", version_id, profile_name, port)
             lock.release()
+            logger.info("Template evaluation lock released version_id=%s profile=%s", version_id, profile_name)
+
+    def list_digital_employees(self) -> list[DigitalEmployeeRead]:
         return list(self.employees.values())
 
     def get_digital_employee(self, employee_id: str) -> DigitalEmployeeRead | None:

@@ -1,6 +1,22 @@
 """集中管理平台运行所需的环境变量和默认配置。"""
 
+import os
+from pathlib import Path
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _read_dashboard_token() -> str:
+    """从环境变量或 token 文件读取 Hermes Dashboard 的 session token。"""
+    token = os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN", "")
+    if token:
+        return token
+    # 开发环境从 platform-dev.sh 写入的 token 文件读取
+    token_file = Path(__file__).parent.parent.parent / ".runtime" / "dashboard-token"
+    try:
+        return token_file.read_text().strip()
+    except (OSError, FileNotFoundError):
+        return ""
 
 
 class Settings(BaseSettings):
@@ -24,6 +40,7 @@ class Settings(BaseSettings):
     hermes_base_url: str = "http://127.0.0.1:8642"
     hermes_api_key: str = ""
     hermes_dashboard_url: str = "http://127.0.0.1:9119"
+    hermes_dashboard_token: str = ""
     eval_port_range_start: int = 8100
     eval_port_range_end: int = 8199
     eval_gateway_start_timeout_seconds: float = 60.0
@@ -33,3 +50,6 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+# 兜底：从文件读取 dashboard token
+if not settings.hermes_dashboard_token:
+    settings.hermes_dashboard_token = _read_dashboard_token()

@@ -22,6 +22,11 @@ HERMES_PROFILE="${HERMES_PROFILE:-aiplatform}"
 HERMES_WRAPPER="${HERMES_WRAPPER:-$HOME/.local/bin/$HERMES_PROFILE}"
 HERMES_PID="$RUNTIME_DIR/hermes-${HERMES_PROFILE}.pid"
 HERMES_LOG="$LOG_DIR/hermes-${HERMES_PROFILE}.log"
+DASHBOARD_HOST="${DASHBOARD_HOST:-127.0.0.1}"
+DASHBOARD_PORT="${DASHBOARD_PORT:-9119}"
+DASHBOARD_PID="$RUNTIME_DIR/dashboard-${HERMES_PROFILE}.pid"
+DASHBOARD_LOG="$LOG_DIR/dashboard-${HERMES_PROFILE}.log"
+DASHBOARD_TOKEN_FILE="$RUNTIME_DIR/dashboard-token"
 
 mkdir -p "$LOG_DIR"
 
@@ -30,11 +35,11 @@ usage() {
 Usage: ./platform-dev.sh <start|stop|restart|status|logs>
 
 Commands:
-  start     启动 Hermes API Server、后端 FastAPI 和前端 Vite
-  stop      关闭前端、后端和本平台专用 Hermes profile
-  restart   重启 Hermes、后端和前端
-  status    查看 Hermes、后端和前端进程状态
-  logs      跟随查看 Hermes、后端和前端日志
+  start     启动 Hermes Gateway、Dashboard、后端 FastAPI 和前端 Vite
+  stop      关闭前端、后端、Dashboard 和本平台专用 Hermes profile
+  restart   重启所有服务
+  status    查看所有服务进程状态
+  logs      跟随查看所有服务日志
 
 Environment overrides:
   HERMES_PROFILE=$HERMES_PROFILE
@@ -115,6 +120,26 @@ wait_for_hermes() {
   return 1
 }
 
+wait_for_dashboard() {
+  local i pid
+  for ((i = 1; i <= 80; i += 1)); do
+    pid="$(pid_from_file "$DASHBOARD_PID")"
+    if ! is_running "$pid"; then
+      echo "Dashboard 进程已退出，查看日志：$DASHBOARD_LOG" >&2
+      return 1
+    fi
+    # /api/status 是 Dashboard 的公开端点，无需认证
+    if curl -fsS "http://${DASHBOARD_HOST}:${DASHBOARD_PORT}/api/status" >/dev/null 2>&1; then
+      echo "Hermes Dashboard 已就绪：http://${DASHBOARD_HOST}:${DASHBOARD_PORT}"
+      return 0
+    fi
+    sleep 0.5
+  done
+
+  echo "Hermes Dashboard 启动后未在预期时间内就绪：http://${DASHBOARD_HOST}:${DASHBOARD_PORT}" >&2
+  return 1
+}
+
 start_hermes() {
   local pid
   pid="$(pid_from_file "$HERMES_PID")"
@@ -131,6 +156,30 @@ start_hermes() {
   setsid "$HERMES_WRAPPER" gateway run > "$HERMES_LOG" 2>&1 < /dev/null &
   echo $! > "$HERMES_PID"
   wait_for_hermes
+}
+
+start_dashboard() {
+  local pid
+  pid="$(pid_from_file "$DASHBOARD_PID")"
+  if is_running "$pid"; then
+    echo "Dashboard 已运行：profile $HERMES_PROFILE，PID $pid"
+    return 0
+  fi
+  if [[ ! -x "$HERMES_WRAPPER" ]]; then
+    echo "Hermes profile wrapper 不存在或不可执行：$HERMES_WRAPPER" >&2
+    return 1
+  fi
+
+  # 生成 session token，传给 Dashboard 并写入文件供 Platform 后端读取
+  local token
+  token="$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")"
+  export HERMES_DASHBOARD_SESSION_TOKEN="$token"
+  echo "$token" > "$DASHBOARD_TOKEN_FILE"
+
+  echo "启动 Hermes Dashboard：profile $HERMES_PROFILE，http://${DASHBOARD_HOST}:${DASHBOARD_PORT}"
+  setsid "$HERMES_WRAPPER" dashboard --port "$DASHBOARD_PORT" --no-open > "$DASHBOARD_LOG" 2>&1 < /dev/null &
+  echo $! > "$DASHBOARD_PID"
+  wait_for_dashboard
 }
 
 start_backend() {
@@ -179,6 +228,10 @@ fallback_pids() {
     hermes)
       pgrep -f "hermes -p ${HERMES_PROFILE} gateway run" || true
       pgrep -f "${HERMES_WRAPPER} gateway run" || true
+      ;;
+    dashboard)
+      pgrep -f "hermes -p ${HERMES_PROFILE} dashboard" || true
+      pgrep -f "${HERMES_WRAPPER} dashboard" || true
       ;;
   esac
 }
@@ -245,31 +298,37 @@ status_service() {
 case "${1:-}" in
   start)
     start_hermes
+    start_dashboard || echo "⚠ Dashboard 启动失败，评测功能不可用；后端和前端继续启动。"
     start_backend
     start_web
     echo
     echo "前端：http://${WEB_HOST}:${WEB_PORT}/"
     echo "后端：http://${BACKEND_HOST}:${BACKEND_PORT}/api/v1"
     echo "Hermes API Server：http://127.0.0.1:8642"
+    echo "Hermes Dashboard：http://${DASHBOARD_HOST}:${DASHBOARD_PORT}"
     echo "日志：$LOG_DIR"
     ;;
   stop)
     stop_service web "前端" "$WEB_PID"
     stop_service backend "后端" "$BACKEND_PID"
+    stop_service dashboard "Dashboard" "$DASHBOARD_PID"
+    rm -f "$DASHBOARD_TOKEN_FILE"
     stop_service hermes "Hermes" "$HERMES_PID"
     ;;
   restart)
     "$0" stop
+    echo
     "$0" start
     ;;
   status)
     status_service hermes "Hermes" "$HERMES_PID" "http://127.0.0.1:8642"
+    status_service dashboard "Dashboard" "$DASHBOARD_PID" "http://${DASHBOARD_HOST}:${DASHBOARD_PORT}"
     status_service backend "后端" "$BACKEND_PID" "http://${BACKEND_HOST}:${BACKEND_PORT}/api/v1"
     status_service web "前端" "$WEB_PID" "http://${WEB_HOST}:${WEB_PORT}/"
     ;;
   logs)
-    touch "$HERMES_LOG" "$BACKEND_LOG" "$WEB_LOG"
-    tail -f "$HERMES_LOG" "$BACKEND_LOG" "$WEB_LOG"
+    touch "$HERMES_LOG" "$DASHBOARD_LOG" "$BACKEND_LOG" "$WEB_LOG"
+    tail -f "$HERMES_LOG" "$DASHBOARD_LOG" "$BACKEND_LOG" "$WEB_LOG"
     ;;
   *)
     usage

@@ -1,10 +1,14 @@
 """HermesDashboardClient 单元测试（使用 httpx MockTransport）。"""
 
 import json
+import logging
+import signal
 
 import httpx
 import pytest
+import yaml
 
+import app.integrations.hermes as hermes_module
 from app.integrations.hermes import HermesDashboardClient
 
 
@@ -75,16 +79,131 @@ class TestHermesDashboardClient:
         result = client.set_model("test", "deepseek", "v4")
         assert result["ok"] is True
 
-    def test_start_gateway(self):
-        """测试启动 Gateway。"""
-        def handler(method, url, _content):
-            if method == "POST" and "/api/gateway/start?profile=test" in url:
-                return 200, {"ok": True, "pid": 12345}
-            return 404, "not found"
+    def test_write_gateway_port_enables_api_server_platform(self, tmp_path, monkeypatch):
+        """评测端口必须写入 Hermes api_server 平台配置。"""
+        fake_home = tmp_path / "home"
+        profile_dir = fake_home / ".hermes" / "profiles" / "eval-profile"
+        profile_dir.mkdir(parents=True)
+        (profile_dir / "config.yaml").write_text(
+            "model: deepseek-chat\n"
+            "platforms:\n"
+            "  telegram:\n"
+            "    enabled: false\n",
+        )
+        monkeypatch.setattr(hermes_module.Path, "home", staticmethod(lambda: fake_home))
 
-        client = _make_client(handler)
-        result = client.start_gateway("test")
+        client = HermesDashboardClient("http://127.0.0.1:9119")
+        client.write_gateway_port("eval-profile", 8192, api_key="eval-secret")
+
+        config = yaml.safe_load((profile_dir / "config.yaml").read_text())
+        api_server = config["platforms"]["api_server"]
+        assert api_server["enabled"] is True
+        assert api_server["extra"]["host"] == "127.0.0.1"
+        assert api_server["extra"]["port"] == 8192
+        assert api_server["extra"]["key"] == "eval-secret"
+        assert "bind" not in config.get("gateway", {})
+
+    def test_write_profile_env_updates_profile_dotenv(self, tmp_path, monkeypatch, caplog):
+        """模型密钥必须写入评测 Profile 的 .env。"""
+        fake_home = tmp_path / "home"
+        profile_dir = fake_home / ".hermes" / "profiles" / "eval-profile"
+        profile_dir.mkdir(parents=True)
+        (profile_dir / ".env").write_text(
+            "EXISTING=value\n"
+            "DEEPSEEK_API_KEY=old\n"
+            "\n",
+        )
+        monkeypatch.setattr(hermes_module.Path, "home", staticmethod(lambda: fake_home))
+        caplog.set_level(logging.INFO)
+
+        client = HermesDashboardClient("http://127.0.0.1:9119")
+        client.write_profile_env("eval-profile", {"DEEPSEEK_API_KEY": "new-secret", "OPENAI_API_KEY": "openai-secret"})
+
+        dotenv = (profile_dir / ".env").read_text().splitlines()
+        assert dotenv == [
+            "EXISTING=value",
+            "DEEPSEEK_API_KEY=new-secret",
+            "OPENAI_API_KEY=openai-secret",
+        ]
+        assert "env_keys=['DEEPSEEK_API_KEY', 'OPENAI_API_KEY']" in caplog.text
+        assert "new-secret" not in caplog.text
+        assert "openai-secret" not in caplog.text
+
+    def test_start_gateway_missing_profile(self, tmp_path, monkeypatch):
+        """测试启动 Gateway。"""
+        # start_gateway 直接 spawn hermes 子进程，不走 Dashboard HTTP API。
+        fake_home = tmp_path / "home"
+        monkeypatch.setattr(hermes_module.Path, "home", staticmethod(lambda: fake_home))
+
+        client = HermesDashboardClient("http://127.0.0.1:9119")
+        with pytest.raises(ValueError, match="Profile 目录不存在"):
+            client.start_gateway("test")
+
+    def test_start_gateway_uses_profile_api_server_config(self, tmp_path, monkeypatch):
+        """评测 Gateway 应启动 Dashboard 创建的 Profile 并固定 API Server 环境。"""
+        fake_home = tmp_path / "home"
+        profile_dir = fake_home / ".hermes" / "profiles" / "eval-profile"
+        profile_dir.mkdir(parents=True)
+        (profile_dir / "config.yaml").write_text(
+            "platforms:\n"
+            "  api_server:\n"
+            "    enabled: true\n"
+            "    extra:\n"
+            "      host: 127.0.0.1\n"
+            "      port: 8192\n"
+            "      key: eval-secret\n"
+        )
+
+        popen_calls = []
+
+        class FakePopen:
+            def __init__(self, cmd, **kwargs):
+                popen_calls.append({"cmd": cmd, **kwargs})
+                self.pid = 12345
+
+        monkeypatch.setattr(hermes_module.Path, "home", staticmethod(lambda: fake_home))
+        monkeypatch.setattr(hermes_module.subprocess, "Popen", FakePopen)
+        monkeypatch.setattr(HermesDashboardClient, "_find_hermes", staticmethod(lambda: "hermes"))
+
+        client = HermesDashboardClient("http://127.0.0.1:9119")
+        result = client.start_gateway("eval-profile")
+
         assert result["ok"] is True
+        assert result["pid"] == 12345
+        assert result["profile_dir"] == str(profile_dir)
+        assert popen_calls
+        assert popen_calls[0]["cmd"] == ["hermes", "-p", "eval-profile", "gateway", "run"]
+        assert popen_calls[0]["start_new_session"] is True
+        env = popen_calls[0]["env"]
+        assert env["HERMES_HOME"] == str(fake_home / ".hermes")
+        assert env["HERMES_KANBAN_DISPATCH_IN_GATEWAY"] == "false"
+        assert env["API_SERVER_ENABLED"] == "true"
+        assert env["API_SERVER_HOST"] == "127.0.0.1"
+        assert env["API_SERVER_PORT"] == "8192"
+        assert env["API_SERVER_KEY"] == "eval-secret"
+
+    def test_stop_spawned_gateway_terminates_started_process(self, monkeypatch):
+        """平台直接 Popen 的评测 Gateway 必须由平台直接清理。"""
+        sent_signals = []
+
+        class FakePopen:
+            pid = 12345
+
+            def poll(self):
+                return None if not sent_signals else 0
+
+            def wait(self, timeout=None):
+                return 0
+
+        monkeypatch.setattr(hermes_module.os, "killpg", lambda pid, sig: sent_signals.append((pid, sig)))
+        monkeypatch.setattr(hermes_module.os, "getpgid", lambda pid: pid)
+
+        client = HermesDashboardClient("http://127.0.0.1:9119")
+        client._spawned_gateways["eval-profile"] = FakePopen()
+
+        assert client.stop_spawned_gateway("eval-profile") is True
+        assert sent_signals == [(12345, signal.SIGTERM)]
+        assert "eval-profile" not in client._spawned_gateways
 
     def test_stop_gateway(self):
         """测试停止 Gateway。"""
