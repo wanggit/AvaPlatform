@@ -11,6 +11,7 @@ import secrets
 import threading
 import time
 import zipfile
+from pathlib import Path
 from threading import RLock
 from typing import Any, Literal
 
@@ -280,6 +281,11 @@ class InMemoryStore:
             return None
         return self.secret_values.get(credential.secret_ref)
 
+    @staticmethod
+    def _skill_archive_path(skill_id: str, package_file_name: str) -> Path:
+        safe_file = re.sub(r"[^A-Za-z0-9._-]+", "-", Path(package_file_name).name).strip(".-") or "skill.zip"
+        return Path(__file__).resolve().parents[1] / ".runtime" / "skill-packages" / f"{skill_id}-{safe_file}"
+
     def _evaluation_profile_env(self, model_config: ModelConfigurationRead | None) -> dict[str, str]:
         if model_config:
             provider = model_config.provider
@@ -296,6 +302,280 @@ class InMemoryStore:
             raise ValueError(f"模型配置「{model_label}」缺少 API Key，无法执行评测。请在模型配置中绑定有效凭据。")
 
         return {_provider_api_key_env_var(provider): secret}
+
+    def _create_evaluation_runtime(self, version: JobTemplateVersionRead, profile_name: str, task_description: str) -> dict[str, Any]:
+        employee_id = f"eval-emp-{version.id[:24]}-{secrets.token_hex(4)}"
+        token = f"eval-token-{secrets.token_urlsafe(32)}"
+        employee = DigitalEmployeeRead(
+            id=employee_id,
+            name=f"评测-{version.role}",
+            nickname=None,
+            avatar_url="",
+            department_id=version.department_id,
+            manager_id=None,
+            job_template_version_id=version.id,
+            notes="模板评测临时员工，评测结束后清理。",
+            role=version.role,
+            grade=version.grade,
+            lifecycle_state="active",
+            runtime_state="healthy",
+            availability_state="idle",
+            max_goal_risk_level=version.max_goal_risk_level,
+            rollout=RolloutState(
+                job_id=new_id("rollout"),
+                current_step="completed",
+                status="passed",
+                summary="模板评测临时运行身份。",
+            ),
+        )
+        goal = GoalRunRead(
+            id=new_id("goal"),
+            title=f"模板评测：{version.role}",
+            goal_type="template_evaluation",
+            description=task_description,
+            owner=employee_id,
+            root_responsible=employee.name,
+            budget_tokens=version.default_goal_budget_tokens,
+            policy={
+                "purpose": "template_evaluation",
+                "job_template_version_id": version.id,
+                "profile_name": profile_name,
+                "risk_level": version.max_goal_risk_level,
+            },
+            status="running",
+        )
+        work_item = WorkItemRead(
+            id=new_id("work"),
+            goal_run_id=goal.id,
+            assignee_employee_id=employee_id,
+            title="模板评测任务",
+            input_payload={"task_description": task_description},
+            budget_tokens=version.default_goal_budget_tokens,
+            status="pending",
+            depth=0,
+            trace_ref=new_id("trace"),
+        )
+
+        self.employees[employee_id] = employee
+        self.employee_service_tokens[token] = employee_id
+        self.goal_runs[goal.id] = goal
+        self.work_items[work_item.id] = work_item
+        logger.info(
+            "Template evaluation runtime created version_id=%s profile=%s employee_id=%s goal_run_id=%s work_item_id=%s",
+            version.id,
+            profile_name,
+            employee_id,
+            goal.id,
+            work_item.id,
+        )
+        return {
+            "employee_id": employee_id,
+            "employee_token": token,
+            "goal_run_id": goal.id,
+            "work_item_id": work_item.id,
+            "trace_ref": work_item.trace_ref,
+        }
+
+    def _cleanup_evaluation_runtime(self, runtime: dict[str, Any] | None) -> None:
+        if not runtime:
+            return
+        self.employee_service_tokens.pop(str(runtime.get("employee_token", "")), None)
+        self.work_items.pop(str(runtime.get("work_item_id", "")), None)
+        self.goal_runs.pop(str(runtime.get("goal_run_id", "")), None)
+        self.employees.pop(str(runtime.get("employee_id", "")), None)
+        logger.info(
+            "Template evaluation runtime cleaned employee_id=%s goal_run_id=%s work_item_id=%s",
+            runtime.get("employee_id"),
+            runtime.get("goal_run_id"),
+            runtime.get("work_item_id"),
+        )
+
+    def _tool_runtime_entries(self, version: JobTemplateVersionRead) -> list[dict[str, Any]]:
+        entries: list[dict[str, Any]] = []
+        for tool_id in version.tools:
+            tool = self.tools.get(tool_id)
+            if not tool:
+                raise ValueError(f"岗位模板绑定的工具不存在：{tool_id}")
+            if tool.lifecycle_status not in {"published", "deprecated"}:
+                raise ValueError(f"岗位模板绑定的工具「{tool.name}」未发布，无法执行真实评测。")
+            entries.append({
+                "tool_id": tool.id,
+                "name": tool.name,
+                "kind": tool.kind,
+                "access_shape": tool.access_shape,
+                "method": tool.method,
+                "request_schema": tool.request_schema,
+                "response_schema": tool.response_schema,
+                "risk_level": tool.risk_level,
+                "approval_required": tool.approval_required,
+                "audit_required": tool.audit_required,
+                "constraints": tool.default_constraints,
+            })
+        return entries
+
+    def _knowledge_runtime_entries(self, version: JobTemplateVersionRead) -> list[dict[str, Any]]:
+        entries: list[dict[str, Any]] = []
+        for source_id in version.knowledge_sources:
+            source = self.knowledge_sources.get(source_id)
+            if not source:
+                raise ValueError(f"岗位模板绑定的知识源不存在：{source_id}")
+            if source.status != "active":
+                raise ValueError(f"岗位模板绑定的知识源「{source.display_name}」未启用，无法执行真实评测。")
+            entries.append({
+                "source_id": source.id,
+                "display_name": source.display_name,
+                "external_id": source.external_id,
+                "source_type": source.source_type,
+                "connection_id": source.connection_id,
+            })
+        return entries
+
+    def _install_evaluation_skills(self, profile_name: str, version: JobTemplateVersionRead) -> list[dict[str, Any]]:
+        installed: list[dict[str, Any]] = []
+        for skill_id in version.skills:
+            skill = self.skill_packages.get(skill_id)
+            if not skill:
+                raise ValueError(f"岗位模板绑定的技能不存在：{skill_id}")
+            if skill.status != "published":
+                raise ValueError(f"岗位模板绑定的技能「{skill.name}」未发布，无法执行真实评测。")
+            archive_path = self._skill_archive_path(skill.id, skill.package_file_name)
+            if archive_path.exists():
+                files = self._dashboard.install_profile_skill_archive(profile_name, skill.name, archive_path)
+                installed.append({"skill_id": skill.id, "name": skill.name, "version": skill.version, "files": files, "mode": "archive"})
+            else:
+                logger.warning(
+                    "Skill archive missing for evaluation; writing metadata wrapper skill skill_id=%s archive=%s",
+                    skill.id,
+                    archive_path,
+                )
+                self._dashboard.write_profile_skill(profile_name, skill.name, self._render_skill_wrapper(skill))
+                installed.append({"skill_id": skill.id, "name": skill.name, "version": skill.version, "files": ["SKILL.md"], "mode": "metadata_wrapper"})
+        return installed
+
+    def _render_skill_wrapper(self, skill: SkillPackageRead) -> str:
+        files = "\n".join(f"- {name}" for name in skill.manifest.get("files", [])) or "- 未记录文件清单"
+        return (
+            f"# {skill.name}\n\n"
+            f"版本：{skill.version}\n\n"
+            f"{skill.description or '平台技能包归档不可用；以下为评测期元数据包装。'}\n\n"
+            "## 包内文件\n\n"
+            f"{files}\n"
+        )
+
+    def _render_platform_runtime_skill(
+        self,
+        runtime: dict[str, Any],
+        tools: list[dict[str, Any]],
+        knowledge_sources: list[dict[str, Any]],
+    ) -> str:
+        tools_text = "\n".join(
+            f"- {tool['name']} (`{tool['tool_id']}`), risk={tool['risk_level']}, approval_required={tool['approval_required']}"
+            for tool in tools
+        ) or "- 无业务工具"
+        knowledge_text = "\n".join(
+            f"- {source['display_name']} (`{source['source_id']}`)"
+            for source in knowledge_sources
+        ) or "- 无知识源"
+        return f"""# AI Platform Runtime
+
+Use this skill whenever the task requires Platform-managed business tools or enterprise knowledge.
+
+## Runtime Context
+
+- Platform API base URL: `$AI_PLATFORM_API_BASE_URL`
+- Employee service token: `$AI_PLATFORM_EMPLOYEE_SERVICE_TOKEN`
+- Goal run id: `$AI_PLATFORM_EVAL_GOAL_RUN_ID`
+- Work item id: `$AI_PLATFORM_EVAL_WORK_ITEM_ID`
+- Trace ref: `{runtime.get('trace_ref')}`
+
+Do not print or reveal the employee service token.
+
+## Business Tool Gateway
+
+Endpoint: `POST $AI_PLATFORM_API_BASE_URL/gateway/tool-calls`
+
+Required JSON fields:
+- `employee_service_token`: value of `$AI_PLATFORM_EMPLOYEE_SERVICE_TOKEN`
+- `goal_run_id`: value of `$AI_PLATFORM_EVAL_GOAL_RUN_ID`
+- `work_item_id`: value of `$AI_PLATFORM_EVAL_WORK_ITEM_ID`
+- `tool_id`: one of the allowed tool ids below
+- `payload`: tool input object
+- `token_cost`: estimated token cost, use `0` for evaluation-only lightweight calls
+
+Allowed tools:
+{tools_text}
+
+## Knowledge Retrieval
+
+Endpoint: `POST $AI_PLATFORM_API_BASE_URL/gateway/knowledge/search`
+
+Required JSON fields:
+- `employee_service_token`: value of `$AI_PLATFORM_EMPLOYEE_SERVICE_TOKEN`
+- `goal_run_id`: value of `$AI_PLATFORM_EVAL_GOAL_RUN_ID`
+- `work_item_id`: value of `$AI_PLATFORM_EVAL_WORK_ITEM_ID`
+- `knowledge_source_id`: one of the authorized source ids below
+- `query`: the search query
+- `top_k`: number of chunks to retrieve
+
+Authorized knowledge sources:
+{knowledge_text}
+"""
+
+    def _retrieve_evaluation_knowledge(self, version: JobTemplateVersionRead, task_description: str, top_k: int = 5) -> list[KnowledgePreviewHit]:
+        sources = [self.knowledge_sources[source_id] for source_id in version.knowledge_sources if source_id in self.knowledge_sources]
+        if not sources:
+            return []
+        hits: list[KnowledgePreviewHit] = []
+        sources_by_connection: dict[str, list[KnowledgeSourceRead]] = {}
+        for source in sources:
+            sources_by_connection.setdefault(source.connection_id, []).append(source)
+        for connection_id, connection_sources in sources_by_connection.items():
+            connection = self.knowledge_connections.get(connection_id)
+            if not connection:
+                names = ", ".join(source.display_name for source in connection_sources)
+                raise ValueError(f"知识源连接不存在，无法检索：{names}")
+            hits.extend(self._retrieve_ragflow_chunks(connection, connection_sources, task_description, top_k))
+        return hits[:top_k]
+
+    def _render_evaluation_run_prompt(
+        self,
+        task_description: str,
+        runtime: dict[str, Any],
+        tools: list[dict[str, Any]],
+        knowledge_sources: list[dict[str, Any]],
+        knowledge_hits: list[KnowledgePreviewHit],
+    ) -> str:
+        sections = ["# 评测任务", task_description.strip()]
+        if tools:
+            sections.extend([
+                "## 可真实调用的业务工具",
+                "\n".join(f"- {tool['name']} (`{tool['tool_id']}`)" for tool in tools),
+            ])
+        if knowledge_sources:
+            sections.extend([
+                "## 授权知识源",
+                "\n".join(f"- {source['display_name']} (`{source['source_id']}`)" for source in knowledge_sources),
+            ])
+        sections.extend([
+            "## 平台运行时调用方式",
+            (
+                "如需调用业务工具或检索更多知识，请使用 Profile 中的 `AI Platform Runtime` skill。"
+                "运行时上下文由环境变量提供："
+                "`AI_PLATFORM_API_BASE_URL`, `AI_PLATFORM_EMPLOYEE_SERVICE_TOKEN`, "
+                "`AI_PLATFORM_EVAL_GOAL_RUN_ID`, `AI_PLATFORM_EVAL_WORK_ITEM_ID`。"
+            ),
+        ])
+        if knowledge_hits:
+            hit_lines = []
+            for index, hit in enumerate(knowledge_hits, start=1):
+                hit_lines.append(
+                    f"### 知识片段 {index}: {hit.source_name} / {hit.document_name}\n"
+                    f"{hit.content}\n"
+                    f"引用: {hit.citation}；score={hit.score}"
+                )
+            sections.extend(["## 已预检索知识片段", "\n\n".join(hit_lines)])
+        sections.append(f"<!-- evaluation_context goal_run_id={runtime.get('goal_run_id')} work_item_id={runtime.get('work_item_id')} -->")
+        return "\n\n".join(sections)
 
     def _department_with_counts(self, department: DepartmentRead) -> DepartmentRead:
         employee_count = sum(1 for employee in self.employees.values() if employee.department_id == department.id)
@@ -522,6 +802,9 @@ class InMemoryStore:
         if not any(name.endswith("SKILL.md") for name in names):
             raise ValueError("技能包必须包含 SKILL.md")
         skill_id = new_id("skill")
+        archive_path = self._skill_archive_path(skill_id, payload.package_file_name)
+        archive_path.parent.mkdir(parents=True, exist_ok=True)
+        archive_path.write_bytes(raw)
         skill = SkillPackageRead(
             id=skill_id,
             name=payload.name,
@@ -586,6 +869,10 @@ class InMemoryStore:
             return False
         if skill.status == "published":
             raise ValueError("已发布的技能无法删除，请先下架")
+        try:
+            self._skill_archive_path(skill.id, skill.package_file_name).unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning("Could not delete skill archive skill_id=%s error=%s", skill.id, exc)
         del self.skill_packages[skill_id]
         self._audit("skill_package_deleted", {"skill_package_id": skill_id})
         return True
@@ -1066,7 +1353,7 @@ class InMemoryStore:
     def retrieve_knowledge(self, payload: KnowledgeRetrievalRequest) -> KnowledgeRetrievalResult:
         employee = self._authenticate_employee(payload.employee_service_token)
         template = self.template_versions[employee.job_template_version_id]
-        if payload.knowledge_source_id not in template.knowledge_sources and payload.knowledge_source_id not in self.knowledge_sources:
+        if payload.knowledge_source_id not in template.knowledge_sources or payload.knowledge_source_id not in self.knowledge_sources:
             raise ValueError("员工未被授权访问该知识源")
         if payload.goal_run_id not in self.goal_runs or payload.work_item_id not in self.work_items:
             raise ValueError("目标运行或工作项不存在")
@@ -1644,6 +1931,7 @@ class InMemoryStore:
         port: int | None = None
         profile_name: str | None = None
         gw_result: dict = {}
+        eval_runtime: dict[str, Any] | None = None
         eval_api_key = settings.hermes_api_key or f"eval-{secrets.token_urlsafe(32)}"
         logger.info(
             "Template evaluation requested version_id=%s role=%s task_chars=%s",
@@ -1699,8 +1987,47 @@ class InMemoryStore:
             self._dashboard.write_soul(profile_name, soul_content)
             logger.info("Hermes evaluation SOUL written version_id=%s profile=%s", version_id, profile_name)
 
-            # 4. 写入 Profile 运行时密钥，Hermes Gateway 启动时会加载该 .env
-            profile_env = self._evaluation_profile_env(model_config)
+            # 4. 创建评测期运行身份，并把模板能力注入 Profile
+            eval_runtime = self._create_evaluation_runtime(version, profile_name, task_description)
+            installed_skills = self._install_evaluation_skills(profile_name, version)
+            tool_entries = self._tool_runtime_entries(version)
+            knowledge_entries = self._knowledge_runtime_entries(version)
+            runtime_skill = self._render_platform_runtime_skill(eval_runtime, tool_entries, knowledge_entries)
+            self._dashboard.write_profile_skill(profile_name, "AI Platform Runtime", runtime_skill)
+            runtime_metadata = {
+                "purpose": "template_evaluation",
+                "template_version_id": version_id,
+                "profile_name": profile_name,
+                "employee_id": eval_runtime["employee_id"],
+                "goal_run_id": eval_runtime["goal_run_id"],
+                "work_item_id": eval_runtime["work_item_id"],
+                "platform_api_base_url": settings.platform_api_base_url,
+                "skills": installed_skills,
+                "tools": tool_entries,
+                "knowledge_sources": knowledge_entries,
+            }
+            self._dashboard.write_profile_file(
+                profile_name,
+                "platform/evaluation-runtime.json",
+                json.dumps(runtime_metadata, ensure_ascii=False, indent=2),
+            )
+            logger.info(
+                "Hermes evaluation capabilities injected version_id=%s profile=%s skills=%s tools=%s knowledge_sources=%s",
+                version_id,
+                profile_name,
+                len(installed_skills),
+                len(tool_entries),
+                len(knowledge_entries),
+            )
+
+            # 5. 写入 Profile 运行时密钥，Hermes Gateway 启动时会加载该 .env
+            profile_env = {
+                **self._evaluation_profile_env(model_config),
+                "AI_PLATFORM_API_BASE_URL": settings.platform_api_base_url.rstrip("/"),
+                "AI_PLATFORM_EMPLOYEE_SERVICE_TOKEN": eval_runtime["employee_token"],
+                "AI_PLATFORM_EVAL_GOAL_RUN_ID": eval_runtime["goal_run_id"],
+                "AI_PLATFORM_EVAL_WORK_ITEM_ID": eval_runtime["work_item_id"],
+            }
             logger.info(
                 "Writing Hermes evaluation profile env version_id=%s profile=%s env_keys=%s",
                 version_id,
@@ -1709,7 +2036,15 @@ class InMemoryStore:
             )
             self._dashboard.write_profile_env(profile_name, profile_env)
 
-            # 5. 配置 API Server 端口（新 Profile 默认端口会与主 Gateway 冲突）
+            knowledge_hits = self._retrieve_evaluation_knowledge(version, task_description)
+            logger.info(
+                "Hermes evaluation knowledge prefetched version_id=%s profile=%s hit_count=%s",
+                version_id,
+                profile_name,
+                len(knowledge_hits),
+            )
+
+            # 6. 配置 API Server 端口（新 Profile 默认端口会与主 Gateway 冲突）
             logger.info(
                 "Configuring Hermes evaluation api_server version_id=%s profile=%s port=%s api_key_configured=%s",
                 version_id,
@@ -1719,7 +2054,7 @@ class InMemoryStore:
             )
             self._dashboard.write_gateway_port(profile_name, port, api_key=eval_api_key)
 
-            # 6. 启动 Gateway
+            # 7. 启动 Gateway
             gw_result = self._dashboard.start_gateway(profile_name)
             gw_log = gw_result.get("log", "未知")
             logger.info(
@@ -1731,7 +2066,7 @@ class InMemoryStore:
                 gw_log,
             )
 
-            # 7. 等待 Gateway 就绪
+            # 8. 等待 Gateway 就绪
             ready = self._dashboard.wait_gateway_ready(
                 port,
                 timeout_seconds=settings.eval_gateway_start_timeout_seconds,
@@ -1756,7 +2091,7 @@ class InMemoryStore:
                 "port": port,
             })
 
-            # 8. 执行评测任务
+            # 9. 执行评测任务
             logger.info(
                 "Submitting Hermes evaluation run version_id=%s profile=%s port=%s timeout_seconds=%s",
                 version_id,
@@ -1769,8 +2104,15 @@ class InMemoryStore:
                 eval_api_key,
                 timeout_seconds=settings.eval_run_timeout_seconds,
             )
-            result = hermes.create_and_wait_run(
+            evaluation_prompt = self._render_evaluation_run_prompt(
                 task_description,
+                eval_runtime,
+                tool_entries,
+                knowledge_entries,
+                knowledge_hits,
+            )
+            result = hermes.create_and_wait_run(
+                evaluation_prompt,
                 metadata={"purpose": "template_evaluation", "template_version_id": version_id},
                 max_wait_seconds=settings.eval_run_timeout_seconds,
             )
@@ -1868,6 +2210,7 @@ class InMemoryStore:
             if port is not None:
                 self.port_pool.release(port)
                 logger.info("Hermes evaluation port released version_id=%s profile=%s port=%s", version_id, profile_name, port)
+            self._cleanup_evaluation_runtime(eval_runtime)
             lock.release()
             logger.info("Template evaluation lock released version_id=%s profile=%s", version_id, profile_name)
 

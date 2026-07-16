@@ -3,9 +3,11 @@
 import logging
 import os
 import re
+import shutil
 import signal
 import subprocess
 import time
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -235,6 +237,15 @@ class HermesDashboardClient:
 
     # ── Profile 管理 ──────────────────────────────────────────
 
+    @staticmethod
+    def _profile_dir(name: str) -> Path:
+        return Path.home() / ".hermes" / "profiles" / name
+
+    @staticmethod
+    def _safe_profile_child_name(name: str) -> str:
+        cleaned = re.sub(r"[\\/:\0]+", "-", name).strip(" .")
+        return cleaned or "skill"
+
     def create_profile(
         self,
         name: str,
@@ -285,7 +296,7 @@ class HermesDashboardClient:
 
     def write_profile_env(self, name: str, values: dict[str, str]) -> None:
         """Update a Profile's .env with secret runtime values."""
-        profile_dir = Path.home() / ".hermes" / "profiles" / name
+        profile_dir = self._profile_dir(name)
         if not profile_dir.exists():
             raise ValueError(f"Profile 目录不存在: {profile_dir}")
 
@@ -330,6 +341,71 @@ class HermesDashboardClient:
             sorted(sanitized.keys()),
             env_path,
         )
+
+    def write_profile_file(self, name: str, relative_path: str, content: str) -> Path:
+        """Write a UTF-8 text file under a Profile directory."""
+        profile_dir = self._profile_dir(name)
+        if not profile_dir.exists():
+            raise ValueError(f"Profile 目录不存在: {profile_dir}")
+        target = (profile_dir / relative_path).resolve()
+        try:
+            target.relative_to(profile_dir.resolve())
+        except ValueError as exc:
+            raise ValueError(f"非法 Profile 文件路径: {relative_path}") from exc
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        logger.info("Hermes profile file written profile=%s path=%s chars=%s", name, target, len(content))
+        return target
+
+    def write_profile_skill(self, name: str, skill_name: str, skill_md: str) -> Path:
+        """Write a single-file Hermes skill into a Profile."""
+        safe_name = self._safe_profile_child_name(skill_name)
+        return self.write_profile_file(name, f"skills/{safe_name}/SKILL.md", skill_md)
+
+    def install_profile_skill_archive(self, name: str, skill_name: str, archive_path: Path) -> list[str]:
+        """Extract a Hermes skill zip into profile skills/<skill_name>/."""
+        profile_dir = self._profile_dir(name)
+        if not profile_dir.exists():
+            raise ValueError(f"Profile 目录不存在: {profile_dir}")
+        if not archive_path.exists():
+            raise ValueError(f"技能包文件不存在: {archive_path}")
+        if not zipfile.is_zipfile(archive_path):
+            raise ValueError(f"技能包不是有效 zip: {archive_path}")
+
+        safe_name = self._safe_profile_child_name(skill_name)
+        destination = profile_dir / "skills" / safe_name
+        if destination.exists():
+            shutil.rmtree(destination)
+        destination.mkdir(parents=True, exist_ok=True)
+
+        installed: list[str] = []
+        with zipfile.ZipFile(archive_path) as package:
+            for info in package.infolist():
+                if info.is_dir():
+                    continue
+                member_path = Path(info.filename)
+                if member_path.is_absolute() or ".." in member_path.parts:
+                    raise ValueError(f"技能包包含非法路径: {info.filename}")
+                target = (destination / member_path).resolve()
+                try:
+                    target.relative_to(destination.resolve())
+                except ValueError as exc:
+                    raise ValueError(f"技能包包含越界路径: {info.filename}") from exc
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with package.open(info) as source, open(target, "wb") as dest:
+                    shutil.copyfileobj(source, dest)
+                installed.append(info.filename)
+
+        if "SKILL.md" not in installed and not any(path.endswith("/SKILL.md") for path in installed):
+            raise ValueError("技能包必须包含 SKILL.md")
+        logger.info(
+            "Hermes profile skill archive installed profile=%s skill=%s archive=%s files=%s",
+            name,
+            safe_name,
+            archive_path,
+            len(installed),
+        )
+        return installed
 
     def write_gateway_port(self, name: str, port: int, *, api_key: str = "") -> None:
         """配置 Profile 的 API Server 监听端口。

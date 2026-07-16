@@ -12,6 +12,7 @@ from psycopg.types.json import Jsonb
 
 from app.config import settings
 from app.db.init import DEFAULT_ORGANIZATION_ID, create_runtime_support_tables, ensure_default_organization
+from app.models.domain import uuid_pk
 
 
 MANAGED_TABLES = [
@@ -117,7 +118,7 @@ def load_relational_state() -> dict[str, Any] | None:
 def save_relational_state(payload: dict[str, Any]) -> None:
     create_runtime_support_tables()
     ensure_default_organization()
-    with psycopg.connect(settings.database_url) as connection:
+    with psycopg.connect(settings.database_url, row_factory=dict_row) as connection:
         _clear_managed_tables(connection)
         _save_departments(connection, payload.get("departments", {}))
         _save_credentials(connection, payload.get("credentials", {}), payload.get("secret_values", {}))
@@ -763,7 +764,7 @@ def _save_job_templates(
             ),
         )
         evaluation = version.get("evaluation") or {}
-        eval_id = f"eval-{version['id']}"
+        eval_id = uuid_pk()
         connection.execute(
             """
             INSERT INTO template_evaluations (
@@ -810,7 +811,7 @@ def _save_job_templates(
                 INSERT INTO job_template_skill_bindings (id, job_template_version_id, skill_version_id)
                 VALUES (%s, %s, %s)
                 """,
-                (f"jtsb-{version['id']}-{skill_id}", version["id"], skill_version_id),
+                (uuid_pk(), version["id"], skill_version_id),
             )
         for tool_id in version.get("tools") or []:
             tool_version_id = _current_tool_version_id(connection, tool_id)
@@ -823,7 +824,7 @@ def _save_job_templates(
                 )
                 VALUES (%s, %s, %s, %s)
                 """,
-                (f"jttb-{version['id']}-{tool_id}", version["id"], tool_version_id, Jsonb({})),
+                (uuid_pk(), version["id"], tool_version_id, Jsonb({})),
             )
         for source_id in version.get("knowledge_sources") or []:
             connection.execute(
@@ -833,7 +834,7 @@ def _save_job_templates(
                 )
                 VALUES (%s, %s, %s, %s, %s, %s)
                 """,
-                (f"rp-{version['id']}-{source_id}", version["id"], source_id, 5, None, True),
+                (uuid_pk(), version["id"], source_id, 5, None, True),
             )
 
 

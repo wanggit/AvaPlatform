@@ -41,6 +41,7 @@ class Settings(BaseSettings):
     hermes_api_key: str = ""
     hermes_dashboard_url: str = "http://127.0.0.1:9119"
     hermes_dashboard_token: str = ""
+    platform_api_base_url: str = "http://127.0.0.1:8010/api/v1"
     eval_port_range_start: int = 8100
     eval_port_range_end: int = 8199
     eval_gateway_start_timeout_seconds: float = 60.0

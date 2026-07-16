@@ -207,11 +207,17 @@ def test_platform_knowledge_retrieval_enforces_employee_authorization(monkeypatc
     assert result.status_code == 200
     assert result.json()["citations"][0]["source_id"] == "ks-faq"
 
+    # 已登记但未绑定到该岗位模板的知识源也必须拒绝。
+    secret_source = api.post("/api/v1/knowledge-connections/kc-ragflow-dev/sources", json={
+        "external_id": "secret_dataset",
+        "display_name": "未授权资料",
+    }).json()
+
     denied = api.post("/api/v1/gateway/knowledge/search", json={
         "employee_service_token": token,
         "goal_run_id": goal_id,
         "work_item_id": work_id,
-        "knowledge_source_id": "ks-secret",
+        "knowledge_source_id": secret_source["id"],
         "query": "未授权资料",
     })
     assert denied.status_code == 409

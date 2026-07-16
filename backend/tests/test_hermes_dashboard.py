@@ -3,6 +3,7 @@
 import json
 import logging
 import signal
+import zipfile
 
 import httpx
 import pytest
@@ -128,6 +129,25 @@ class TestHermesDashboardClient:
         assert "env_keys=['DEEPSEEK_API_KEY', 'OPENAI_API_KEY']" in caplog.text
         assert "new-secret" not in caplog.text
         assert "openai-secret" not in caplog.text
+
+    def test_install_profile_skill_archive_extracts_safe_zip(self, tmp_path, monkeypatch):
+        """评测 Profile 应能安装平台上传的 Hermes skill zip。"""
+        fake_home = tmp_path / "home"
+        profile_dir = fake_home / ".hermes" / "profiles" / "eval-profile"
+        profile_dir.mkdir(parents=True)
+        archive = tmp_path / "customer-skill.zip"
+        with zipfile.ZipFile(archive, "w") as package:
+            package.writestr("SKILL.md", "# 客服沟通技能\n")
+            package.writestr("references/playbook.md", "处理 SOP\n")
+        monkeypatch.setattr(hermes_module.Path, "home", staticmethod(lambda: fake_home))
+
+        client = HermesDashboardClient("http://127.0.0.1:9119")
+        installed = client.install_profile_skill_archive("eval-profile", "客服沟通技能", archive)
+
+        skill_dir = profile_dir / "skills" / "客服沟通技能"
+        assert (skill_dir / "SKILL.md").read_text() == "# 客服沟通技能\n"
+        assert (skill_dir / "references" / "playbook.md").read_text() == "处理 SOP\n"
+        assert installed == ["SKILL.md", "references/playbook.md"]
 
     def test_start_gateway_missing_profile(self, tmp_path, monkeypatch):
         """测试启动 Gateway。"""
