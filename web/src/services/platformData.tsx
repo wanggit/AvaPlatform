@@ -22,7 +22,7 @@ import {
   type TemplateOutcomeReport,
   type UsageAnalyticsRow,
 } from '../types/domain';
-import { api, fetchPlatformData, mapAuditEvent, mapAuditRule, mapCredential, mapDepartment, mapGoal, mapGoalBudgetPolicy, mapKnowledgeConnection, mapKnowledgeSource, mapModel, mapQuota, mapSkill, mapTemplate, mapTool, type BackendModel } from './api';
+import { api, fetchPlatformData, mapAuditEvent, mapAuditRule, mapCredential, mapDepartment, mapEmployee, mapGoal, mapGoalBudgetPolicy, mapKnowledgeConnection, mapKnowledgeSource, mapModel, mapQuota, mapSkill, mapTemplate, mapTool, type BackendModel } from './api';
 
 interface PlatformData {
   source: 'backend' | 'unavailable';

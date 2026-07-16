@@ -1,5 +1,6 @@
 """封装 Hermes API Server 的正式 HTTP 调用。"""
 
+import json
 import logging
 import os
 import re
@@ -9,7 +10,7 @@ import subprocess
 import time
 import zipfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 
@@ -100,14 +101,109 @@ class HermesClient:
         with self._client() as client:
             response = client.get(f"/v1/runs/{run_id}/events")
             response.raise_for_status()
+            content_type = response.headers.get("content-type", "")
+            if "text/event-stream" in content_type:
+                return self._parse_sse_events(response.text)
             body = response.json()
             return body["events"] if isinstance(body, dict) and "events" in body else body
 
-    def approve_run(self, run_id: str, approval_id: str, approved: bool, reason: str | None = None) -> dict[str, Any]:
+    def _parse_sse_events(self, text: str) -> list[dict[str, Any]]:
+        events: list[dict[str, Any]] = []
+        data_lines: list[str] = []
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                if data_lines:
+                    event = self._decode_sse_data(data_lines)
+                    if event is not None:
+                        events.append(event)
+                    data_lines = []
+                continue
+            if line.startswith(":"):
+                continue
+            if line.startswith("data:"):
+                data_lines.append(line[5:].strip())
+        if data_lines:
+            event = self._decode_sse_data(data_lines)
+            if event is not None:
+                events.append(event)
+        return events
+
+    def _decode_sse_data(self, data_lines: list[str]) -> dict[str, Any] | None:
+        payload = "\n".join(data_lines).strip()
+        if not payload:
+            return None
+        try:
+            event = json.loads(payload)
+        except json.JSONDecodeError:
+            return {"event": "message.delta", "delta": payload}
+        return event if isinstance(event, dict) else {"event": "message.delta", "delta": str(event)}
+
+    def _text_from_value(self, value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list):
+            return "".join(self._text_from_value(item) for item in value)
+        if isinstance(value, dict):
+            for key in ("text", "content", "output_text", "value", "message"):
+                text = self._text_from_value(value.get(key))
+                if text.strip():
+                    return text
+            return json.dumps(value, ensure_ascii=False)
+        return str(value)
+
+    def _run_output_text(self, run: dict[str, Any]) -> str:
+        for key in ("output", "response", "result", "final_response"):
+            text = self._text_from_value(run.get(key))
+            if text.strip():
+                return text
+        message = run.get("message")
+        if isinstance(message, dict):
+            text = self._text_from_value(message.get("content"))
+            if text.strip():
+                return text
+        return ""
+
+    def _events_output_text(self, events: list[dict[str, Any]]) -> str:
+        completed_parts: list[str] = []
+        delta_parts: list[str] = []
+        for event in events:
+            event_name = str(event.get("event") or event.get("type") or "")
+            completed_text = self._text_from_value(event.get("output") or event.get("final_response"))
+            if event_name in {"run.completed", "response.completed"} and completed_text.strip():
+                completed_parts.append(completed_text)
+                continue
+            delta_text = self._text_from_value(
+                event.get("delta")
+                or event.get("text")
+                or event.get("content")
+                or event.get("message")
+            )
+            if delta_text.strip():
+                delta_parts.append(delta_text)
+        return "".join(completed_parts or delta_parts)
+
+    def approve_run(
+        self,
+        run_id: str,
+        approval_id: str,
+        approved: bool,
+        reason: str | None = None,
+        *,
+        choice: str | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "approval_id": approval_id,
+            "choice": choice or ("once" if approved else "deny"),
+        }
+        if reason:
+            body["reason"] = reason
         with self._client() as client:
             response = client.post(
                 f"/v1/runs/{run_id}/approval",
-                json={"approval_id": approval_id, "approved": approved, "reason": reason},
+                json=body,
             )
             response.raise_for_status()
             return response.json()
@@ -133,6 +229,7 @@ class HermesClient:
         max_tokens: int | None = None,
         poll_interval_seconds: float = 3.0,
         max_wait_seconds: float = 300.0,
+        on_waiting_for_approval: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         """创建运行并轮询直到完成，返回包含完整输出的结果。"""
         run = self.create_run(prompt, metadata=metadata, max_tokens=max_tokens)
@@ -142,32 +239,38 @@ class HermesClient:
 
         deadline = time.monotonic() + max_wait_seconds
         terminal_statuses = {"completed", "failed", "error", "stopped", "cancelled"}
+        approval_wait_notified = False
 
         while time.monotonic() < deadline:
             run = self.get_run(run_id)
             status = run.get("status", "")
+            if status == "waiting_for_approval":
+                if on_waiting_for_approval and not approval_wait_notified:
+                    on_waiting_for_approval(run)
+                    approval_wait_notified = True
+            else:
+                approval_wait_notified = False
             if status in terminal_statuses:
                 # 收集 events 中的文本输出拼成完整回复
                 output_parts: list[str] = []
 
                 # 优先从 run 的 output/response 字段取
-                direct_output = run.get("output") or run.get("response") or run.get("result")
-                if direct_output and isinstance(direct_output, str) and direct_output.strip():
+                direct_output = self._run_output_text(run)
+                if direct_output.strip():
                     output_parts.append(direct_output)
 
-                # 也尝试从 events 中收集文本
-                try:
-                    events = self.get_run_events(run_id)
-                    for event in events if isinstance(events, list) else []:
-                        if isinstance(event, dict):
-                            delta = event.get("delta") or event.get("text") or event.get("content") or ""
-                            if isinstance(delta, str) and delta.strip():
-                                output_parts.append(delta)
-                except (httpx.HTTPError, ValueError):
-                    pass  # events 获取失败不影响主流程
+                if not output_parts:
+                    # 也尝试从 events 中收集文本
+                    try:
+                        events = self.get_run_events(run_id)
+                        events_output = self._events_output_text(events if isinstance(events, list) else [])
+                        if events_output.strip():
+                            output_parts.append(events_output)
+                    except (httpx.HTTPError, ValueError):
+                        pass  # events 获取失败不影响主流程
 
                 if not output_parts:
-                    output_parts.append(str(run))
+                    output_parts.append(json.dumps(run, ensure_ascii=False))
 
                 run["output"] = "".join(output_parts)
                 logger.info(

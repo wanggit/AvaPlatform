@@ -82,6 +82,37 @@ def test_hermes_client_lists_toolsets_from_api_server() -> None:
     assert client.list_toolsets()[0]["tools"] == ["read_file"]
 
 
+def test_hermes_client_collects_output_from_sse_run_events() -> None:
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(f"{request.method} {request.url.path}")
+        if request.method == "POST" and request.url.path == "/v1/runs":
+            return httpx.Response(202, json={"run_id": "run-001", "status": "started"})
+        if request.method == "GET" and request.url.path == "/v1/runs/run-001":
+            return httpx.Response(200, json={"run_id": "run-001", "status": "completed", "output": ""})
+        if request.method == "GET" and request.url.path == "/v1/runs/run-001/events":
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                text=(
+                    'data: {"event":"message.delta","delta":"第一段"}\n\n'
+                    'data: {"event":"message.delta","delta":"第二段"}\n\n'
+                    'data: {"event":"run.completed","output":""}\n\n'
+                    ': stream closed\n\n'
+                ),
+            )
+        return httpx.Response(404, json={"error": "not found"})
+
+    client = HermesClient("http://hermes.local", transport=httpx.MockTransport(handler))
+
+    result = client.create_and_wait_run("执行评测", poll_interval_seconds=0.01, max_wait_seconds=1)
+
+    assert result["status"] == "completed"
+    assert result["output"] == "第一段第二段"
+    assert "GET /v1/runs/run-001/events" in calls
+
+
 def test_runtime_health_state_mapping() -> None:
     assert runtime_state_from_probe(HealthProbe(process_running=True, api_reachable=True)) == "healthy"
     assert runtime_state_from_probe(HealthProbe(process_running=True, api_reachable=False, consecutive_failures=1)) == "recovering"

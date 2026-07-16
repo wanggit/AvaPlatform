@@ -70,6 +70,7 @@ from app.schemas import (
     TemplateSkillBindingCreate,
     TemplateSkillBindingRead,
     TemplateEvaluationRunRequest,
+    TemplateEvaluationRunRead,
     TemplateEvaluationRunResponse,
     OrganizationQuotaPolicyCreate,
     OrganizationQuotaPolicyRead,
@@ -506,7 +507,10 @@ def list_approvals(
 
 @router.post("/approvals/{approval_id}/approve", response_model=ApprovalRequestRead)
 def approve_request(approval_id: str, payload: ApprovalDecision) -> ApprovalRequestRead:
-    approval = store.decide_approval(approval_id, "approved", payload)
+    try:
+        approval = store.decide_approval(approval_id, "approved", payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     if not approval:
         raise HTTPException(status_code=404, detail="审批请求不存在")
     return approval
@@ -514,7 +518,10 @@ def approve_request(approval_id: str, payload: ApprovalDecision) -> ApprovalRequ
 
 @router.post("/approvals/{approval_id}/reject", response_model=ApprovalRequestRead)
 def reject_request(approval_id: str, payload: ApprovalDecision) -> ApprovalRequestRead:
-    approval = store.decide_approval(approval_id, "rejected", payload)
+    try:
+        approval = store.decide_approval(approval_id, "rejected", payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     if not approval:
         raise HTTPException(status_code=404, detail="审批请求不存在")
     return approval
@@ -522,7 +529,10 @@ def reject_request(approval_id: str, payload: ApprovalDecision) -> ApprovalReque
 
 @router.post("/approvals/{approval_id}/needs-info", response_model=ApprovalRequestRead)
 def request_approval_info(approval_id: str, payload: ApprovalDecision) -> ApprovalRequestRead:
-    approval = store.decide_approval(approval_id, "needs_info", payload)
+    try:
+        approval = store.decide_approval(approval_id, "needs_info", payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     if not approval:
         raise HTTPException(status_code=404, detail="审批请求不存在")
     return approval
@@ -530,7 +540,10 @@ def request_approval_info(approval_id: str, payload: ApprovalDecision) -> Approv
 
 @router.post("/approvals/{approval_id}/expire", response_model=ApprovalRequestRead)
 def expire_request(approval_id: str, payload: ApprovalDecision) -> ApprovalRequestRead:
-    approval = store.decide_approval(approval_id, "expired", payload)
+    try:
+        approval = store.decide_approval(approval_id, "expired", payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     if not approval:
         raise HTTPException(status_code=404, detail="审批请求不存在")
     return approval
@@ -759,6 +772,35 @@ def update_template_evaluation(version_id: str, payload: JobTemplateEvaluationUp
     if not evaluation:
         raise HTTPException(status_code=404, detail="岗位模板版本不存在")
     return evaluation
+
+
+@router.post("/job-template-versions/{version_id}/evaluation/runs", response_model=TemplateEvaluationRunRead, status_code=202)
+def start_template_evaluation_run(version_id: str, payload: TemplateEvaluationRunRequest) -> TemplateEvaluationRunRead:
+    try:
+        return store.start_template_evaluation_run(version_id, payload)
+    except ConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=404 if "不存在" in str(exc) else 400, detail=str(exc)) from exc
+
+
+@router.get("/job-template-versions/{version_id}/evaluation/runs", response_model=list[TemplateEvaluationRunRead])
+def list_template_evaluation_runs(
+    version_id: str,
+    active: bool | None = None,
+    limit: int = 20,
+) -> list[TemplateEvaluationRunRead]:
+    if not store.get_job_template_version(version_id):
+        raise HTTPException(status_code=404, detail="岗位模板版本不存在")
+    return store.list_template_evaluation_runs(version_id, active=active, limit=limit)
+
+
+@router.get("/job-template-versions/{version_id}/evaluation/runs/{run_id}", response_model=TemplateEvaluationRunRead)
+def get_template_evaluation_run(version_id: str, run_id: str) -> TemplateEvaluationRunRead:
+    run = store.get_template_evaluation_run(version_id, run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="模板评测运行不存在")
+    return run
 
 
 @router.post("/job-template-versions/{version_id}/evaluation/run", response_model=TemplateEvaluationRunResponse)

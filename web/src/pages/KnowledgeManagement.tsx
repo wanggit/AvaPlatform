@@ -53,7 +53,6 @@ export default function KnowledgeManagement() {
     setKnowledgeSources: setSources,
     templates,
     source,
-    refresh,
     refreshKnowledgeConnection,
     refreshKnowledgeSources,
   } = usePlatformData();

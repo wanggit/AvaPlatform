@@ -16,6 +16,7 @@ from app.models.domain import uuid_pk
 
 
 MANAGED_TABLES = [
+    "template_evaluation_runs",
     "review_tasks",
     "audit_rule_evaluations",
     "artifact_acceptances",
@@ -89,6 +90,7 @@ def load_relational_state() -> dict[str, Any] | None:
         payload["audit_rule_evaluations"] = _load_audit_rule_evaluations(connection)
         payload["review_tasks"] = _load_review_tasks(connection)
         payload["idempotency_results"] = _load_tool_idempotency_results(connection)
+        payload["template_evaluation_runs"] = _load_template_evaluation_runs(connection)
 
     has_rows = any(
         payload[key]
@@ -110,6 +112,7 @@ def load_relational_state() -> dict[str, Any] | None:
             "metric_definitions",
             "audit_events",
             "audit_rules",
+            "template_evaluation_runs",
         )
     )
     return payload if has_rows or payload["organization_quota"] else None
@@ -150,6 +153,7 @@ def save_relational_state(payload: dict[str, Any]) -> None:
         _save_audit_rule_evaluations(connection, payload.get("audit_rule_evaluations", {}))
         _save_review_tasks(connection, payload.get("review_tasks", {}))
         _save_tool_idempotency_results(connection, payload.get("idempotency_results", {}))
+        _save_template_evaluation_runs(connection, payload.get("template_evaluation_runs", {}))
         connection.commit()
 
 
@@ -184,6 +188,7 @@ def _empty_payload() -> dict[str, Any]:
         "departments": {},
         "template_versions": {},
         "employees": {},
+        "template_evaluation_runs": {},
     }
 
 
@@ -1179,9 +1184,9 @@ def _save_digital_employees(connection: psycopg.Connection, employees: dict[str,
             INSERT INTO digital_employees (
                 id, organization_id, department_id, manager_id, job_template_version_id,
                 name, nickname, avatar_url, notes, lifecycle_state, runtime_state,
-                availability_state, max_goal_risk_level
+                availability_state, max_goal_risk_level, created_at
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
             """,
             (
                 employee["id"],
@@ -1800,6 +1805,59 @@ def _save_tool_idempotency_results(connection: psycopg.Connection, results: dict
             VALUES (%s, %s, %s)
             """,
             (key, result.get("tool_id"), Jsonb(result)),
+        )
+
+
+def _load_template_evaluation_runs(connection: psycopg.Connection) -> dict[str, dict[str, Any]]:
+    rows = connection.execute(
+        """
+        SELECT id, job_template_version_id, task_description, status, hermes_run_id,
+               hermes_output, error_message, started_at, updated_at, completed_at, steps_json
+        FROM template_evaluation_runs
+        ORDER BY started_at DESC
+        """
+    ).fetchall()
+    return {
+        row["id"]: {
+            "id": row["id"],
+            "job_template_version_id": row["job_template_version_id"],
+            "task_description": row["task_description"],
+            "status": row["status"],
+            "hermes_run_id": row["hermes_run_id"],
+            "hermes_output": row["hermes_output"] or "",
+            "error_message": row["error_message"],
+            "started_at": row["started_at"],
+            "updated_at": row["updated_at"],
+            "completed_at": row["completed_at"],
+            "steps": row["steps_json"] or [],
+        }
+        for row in rows
+    }
+
+
+def _save_template_evaluation_runs(connection: psycopg.Connection, runs: dict[str, dict[str, Any]]) -> None:
+    for run in runs.values():
+        connection.execute(
+            """
+            INSERT INTO template_evaluation_runs (
+                id, job_template_version_id, task_description, status, hermes_run_id,
+                hermes_output, error_message, started_at, updated_at, completed_at, steps_json
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                run["id"],
+                run["job_template_version_id"],
+                run["task_description"],
+                run.get("status", "queued"),
+                run.get("hermes_run_id"),
+                run.get("hermes_output") or "",
+                run.get("error_message"),
+                run["started_at"],
+                run["updated_at"],
+                run.get("completed_at"),
+                Jsonb(run.get("steps") or []),
+            ),
         )
 
 

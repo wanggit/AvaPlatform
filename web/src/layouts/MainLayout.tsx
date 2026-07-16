@@ -1,7 +1,9 @@
 // 主布局组件：维护左侧导航、顶部状态区和页面内容出口。
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Outlet, useNavigate, useLocation } from 'react-router-dom';
 import {
+  Badge,
+  Button,
   Layout,
   Menu,
   Avatar,
@@ -9,6 +11,7 @@ import {
   theme,
   Typography,
   Space,
+  Tooltip,
 } from 'antd';
 import {
   DashboardOutlined,
@@ -30,6 +33,7 @@ import {
   MenuUnfoldOutlined,
   LogoutOutlined,
 } from '@ant-design/icons';
+import { api } from '../services/api';
 
 const { Header, Sider, Content } = Layout;
 const { Text } = Typography;
@@ -68,11 +72,40 @@ const menuItems = [
 
 export default function MainLayout() {
   const [collapsed, setCollapsed] = useState(false);
+  const [pendingApprovalCount, setPendingApprovalCount] = useState(0);
   const navigate = useNavigate();
   const location = useLocation();
   const { token } = theme.useToken();
 
   const selectedKey = '/' + (location.pathname.split('/')[1] || 'dashboard');
+
+  const loadPendingApprovalCount = async () => {
+    try {
+      const approvals = await api.get<Array<{ id: string }>>('/approvals?status=pending');
+      setPendingApprovalCount(approvals.length);
+    } catch {
+      setPendingApprovalCount(0);
+    }
+  };
+
+  useEffect(() => {
+    void loadPendingApprovalCount();
+    const timer = window.setInterval(() => {
+      void loadPendingApprovalCount();
+    }, 10000);
+    const refresh = () => {
+      void loadPendingApprovalCount();
+    };
+    window.addEventListener('platform-approvals-updated', refresh);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener('platform-approvals-updated', refresh);
+    };
+  }, []);
+
+  useEffect(() => {
+    void loadPendingApprovalCount();
+  }, [location.pathname]);
 
   const userMenu = {
     items: [
@@ -152,12 +185,26 @@ export default function MainLayout() {
               AI 数字员工平台 — 管理后台
             </Text>
           </Space>
-          <Dropdown menu={userMenu} placement="bottomRight">
-            <Space style={{ cursor: 'pointer' }}>
-              <Avatar size="small" icon={<UserOutlined />} />
-              <Text>管理员</Text>
-            </Space>
-          </Dropdown>
+          <Space size={16}>
+            <Tooltip title={pendingApprovalCount ? `${pendingApprovalCount} 个待处理审批` : '暂无待处理审批'}>
+              <Badge count={pendingApprovalCount} size="small" overflowCount={99}>
+                <Button
+                  type="text"
+                  aria-label={`审批待办 ${pendingApprovalCount}`}
+                  icon={<SafetyCertificateOutlined />}
+                  onClick={() => navigate('/approvals')}
+                >
+                  审批待办
+                </Button>
+              </Badge>
+            </Tooltip>
+            <Dropdown menu={userMenu} placement="bottomRight">
+              <Space style={{ cursor: 'pointer' }}>
+                <Avatar size="small" icon={<UserOutlined />} />
+                <Text>管理员</Text>
+              </Space>
+            </Dropdown>
+          </Space>
         </Header>
         <Content
           style={{

@@ -18,6 +18,7 @@ import KnowledgeManagement from './pages/KnowledgeManagement';
 import QuotaManagement from './pages/QuotaManagement';
 import AuditManagement from './pages/AuditManagement';
 import ApprovalCenter from './pages/ApprovalCenter';
+import TemplateEvaluationRun from './pages/TemplateEvaluationRun';
 import { PlatformDataProvider } from './services/platformData';
 
 export default function App() {
@@ -44,6 +45,8 @@ export default function App() {
               <Route path="approvals" element={<ApprovalCenter />} />
               <Route path="kpi" element={<KPIReports />} />
               <Route path="templates" element={<TemplateManagement />} />
+              <Route path="templates/:versionId/evaluation" element={<TemplateEvaluationRun />} />
+              <Route path="templates/:versionId/evaluation-runs/:runId" element={<TemplateEvaluationRun />} />
               <Route path="departments" element={<DepartmentManagement />} />
               <Route path="skills" element={<SkillManagement />} />
               <Route path="tools" element={<ToolManagement />} />

@@ -45,7 +45,7 @@ class Settings(BaseSettings):
     eval_port_range_start: int = 8100
     eval_port_range_end: int = 8199
     eval_gateway_start_timeout_seconds: float = 60.0
-    eval_run_timeout_seconds: float = 300.0
+    eval_run_timeout_seconds: float = 600.0
 
     model_config = SettingsConfigDict(env_prefix="AI_PLATFORM_", env_file=".env", extra="ignore")
 

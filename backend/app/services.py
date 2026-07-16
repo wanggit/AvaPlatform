@@ -13,7 +13,7 @@ import time
 import zipfile
 from pathlib import Path
 from threading import RLock
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 import httpx
 
@@ -100,6 +100,10 @@ from app.schemas import (
     SkillPackageUpload,
     TemplateSkillBindingCreate,
     TemplateSkillBindingRead,
+    TemplateEvaluationRunRequest,
+    TemplateEvaluationRunRead,
+    TemplateEvaluationRunStep,
+    TemplateEvaluationRunStatus,
     BusinessOutcomeMetricBindingRead,
     OrganizationQuotaPolicyCreate,
     OrganizationQuotaPolicyRead,
@@ -145,11 +149,29 @@ def _provider_api_key_env_var(provider: str) -> str:
     return f"{re.sub(r'[^a-z0-9]+', '_', normalized).strip('_').upper()}_API_KEY"
 
 
+def _now_text() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
 def _log_preview(value: str, limit: int = 500) -> str:
     compact = " ".join(value.split())
     if len(compact) <= limit:
         return compact
     return f"{compact[:limit]}..."
+
+
+def _looks_like_incomplete_evaluation_output(value: str) -> bool:
+    """Detect Hermes replies that only report pending background work."""
+    text = " ".join((value or "").split())
+    if not text:
+        return True
+    return (
+        ("稍后" in text and ("汇总" in text or "结果返回" in text or "整合" in text))
+        or ("请稍候" in text and ("汇总" in text or "结果" in text or "完成" in text))
+        or ("正在并行" in text and ("子任务" in text or "搜索分析" in text or "调研" in text))
+        or ("子任务" in text and ("已启动" in text or "后台" in text))
+        or ("后台" in text and ("等待" in text or "稍后" in text or "完成后" in text))
+    )
 
 
 class InMemoryStore:
@@ -215,6 +237,9 @@ class InMemoryStore:
         self.work_items: dict[str, WorkItemRead] = {}
         self.execution_edges: dict[str, ExecutionGraphEdgeRead] = {}
         self.approvals: dict[str, ApprovalRequestRead] = {}
+        self._hermes_approval_runtime: dict[str, dict[str, str]] = {}
+        self.template_evaluation_runs: dict[str, TemplateEvaluationRunRead] = {}
+        self._template_evaluation_run_threads: dict[str, threading.Thread] = {}
         self.artifacts: dict[str, ArtifactRead] = {}
         self.artifact_acceptances: dict[str, ArtifactAcceptanceRead] = {}
         self.employee_service_tokens: dict[str, str] = {}
@@ -563,6 +588,14 @@ Authorized knowledge sources:
                 "运行时上下文由环境变量提供："
                 "`AI_PLATFORM_API_BASE_URL`, `AI_PLATFORM_EMPLOYEE_SERVICE_TOKEN`, "
                 "`AI_PLATFORM_EVAL_GOAL_RUN_ID`, `AI_PLATFORM_EVAL_WORK_ITEM_ID`。"
+            ),
+            "## 输出完成性要求",
+            (
+                "必须在当前 Hermes Run 内返回最终评测结果。"
+                "禁止使用后台或异步子任务、后台命令、cronjob 或任何需要后续轮次才能汇总的工作方式。"
+                "如使用同步委派或工具调用，必须等待所有结果完成并整合后再结束。"
+                "不得返回“稍后汇总”、“请稍候”、“子任务已启动”、“等待结果返回后再整合”等中间状态。"
+                "最终输出应直接包含本次评测任务的完成结果、关键依据、使用过的技能/工具/知识源，以及可供人工评审的结论。"
             ),
         ])
         if knowledge_hits:
@@ -1320,6 +1353,147 @@ Authorized knowledge sources:
             raise ValueError(f"工具调用失败：{exc}") from exc
         return body if isinstance(body, dict) else {"result": body}
 
+    def _register_hermes_evaluation_approval(
+        self,
+        *,
+        version: JobTemplateVersionRead,
+        profile_name: str,
+        port: int,
+        run: dict[str, Any],
+        hermes_base_url: str,
+        hermes_api_key: str,
+    ) -> ApprovalRequestRead | None:
+        lock = getattr(self, "_state_lock", None)
+        if lock:
+            with lock:
+                return self._register_hermes_evaluation_approval_unlocked(
+                    version=version,
+                    profile_name=profile_name,
+                    port=port,
+                    run=run,
+                    hermes_base_url=hermes_base_url,
+                    hermes_api_key=hermes_api_key,
+                )
+        return self._register_hermes_evaluation_approval_unlocked(
+            version=version,
+            profile_name=profile_name,
+            port=port,
+            run=run,
+            hermes_base_url=hermes_base_url,
+            hermes_api_key=hermes_api_key,
+        )
+
+    def _register_hermes_evaluation_approval_unlocked(
+        self,
+        *,
+        version: JobTemplateVersionRead,
+        profile_name: str,
+        port: int,
+        run: dict[str, Any],
+        hermes_base_url: str,
+        hermes_api_key: str,
+    ) -> ApprovalRequestRead | None:
+        run_id = str(run.get("run_id") or run.get("id") or "")
+        if not run_id:
+            logger.warning(
+                "Hermes evaluation approval skipped because run_id is missing version_id=%s profile=%s",
+                version.id,
+                profile_name,
+            )
+            return None
+
+        for approval in self.approvals.values():
+            if (
+                approval.status == "pending"
+                and approval.context.get("source") == "hermes_evaluation_run"
+                and approval.context.get("hermes_run_id") == run_id
+            ):
+                self._hermes_approval_runtime[approval.id] = {
+                    "base_url": hermes_base_url,
+                    "api_key": hermes_api_key,
+                    "run_id": run_id,
+                }
+                self._persist_runtime_state()
+                return approval
+
+        approval_id = new_id("approval")
+        context = {
+            "source": "hermes_evaluation_run",
+            "summary": "岗位模板评测中的 Hermes Run 正在等待人工审批。",
+            "proposed_action": "通过表示允许本次 Hermes 待审批操作一次；拒绝表示阻止该操作。",
+            "template_version_id": version.id,
+            "template_role": version.role,
+            "profile_name": profile_name,
+            "gateway_port": port,
+            "hermes_run_id": run_id,
+            "hermes_status": run.get("status", "waiting_for_approval"),
+        }
+        pending = ApprovalRequestRead(
+            id=approval_id,
+            approval_type="sensitive_operation",
+            status="pending",
+            risk_level="high",
+            goal_run_id=None,
+            work_item_id=None,
+            assignee="平台管理员",
+            context=context,
+        )
+        self.approvals[approval_id] = pending
+        self._hermes_approval_runtime[approval_id] = {
+            "base_url": hermes_base_url,
+            "api_key": hermes_api_key,
+            "run_id": run_id,
+        }
+        self._audit("approval_requested", {
+            "approval_id": approval_id,
+            "source": "hermes_evaluation_run",
+            "template_version_id": version.id,
+            "run_id": run_id,
+        })
+        logger.warning(
+            "Hermes evaluation waiting for approval version_id=%s profile=%s run_id=%s approval_id=%s",
+            version.id,
+            profile_name,
+            run_id,
+            approval_id,
+        )
+        self._persist_runtime_state()
+        return pending
+
+    def _decide_hermes_evaluation_approval(
+        self,
+        approval: ApprovalRequestRead,
+        status: str,
+        payload: ApprovalDecision,
+    ) -> None:
+        if approval.context.get("source") != "hermes_evaluation_run":
+            return
+        runtime = self._hermes_approval_runtime.get(approval.id)
+        if not runtime:
+            raise ValueError("Hermes 评测审批运行上下文已失效，请重新执行评测。")
+        run_id = runtime["run_id"]
+        client = HermesClient(
+            runtime["base_url"],
+            runtime.get("api_key") or None,
+            timeout_seconds=30,
+        )
+        try:
+            client.approve_run(
+                run_id,
+                approval.id,
+                approved=status == "approved",
+                reason=payload.reason,
+                choice="once" if status == "approved" else "deny",
+            )
+        except httpx.HTTPError as exc:
+            raise ValueError(f"Hermes 评测审批恢复失败：{exc}") from exc
+        logger.info(
+            "Hermes evaluation approval decided approval_id=%s run_id=%s status=%s",
+            approval.id,
+            run_id,
+            status,
+        )
+
     def list_approvals(
         self,
         status: str | None = None,
@@ -1345,8 +1519,12 @@ Authorized knowledge sources:
         approval = self.approvals.get(approval_id)
         if not approval:
             return None
+        if approval.context.get("source") == "hermes_evaluation_run" and status in {"approved", "rejected"}:
+            self._decide_hermes_evaluation_approval(approval, status, payload)
         updated = approval.model_copy(update={"status": status, "decision_by": payload.decision_by, "decision_reason": payload.reason})
         self.approvals[approval_id] = updated
+        if approval.context.get("source") == "hermes_evaluation_run" and status in {"approved", "rejected", "expired"}:
+            self._hermes_approval_runtime.pop(approval_id, None)
         self._audit("approval_decided", {"approval_id": approval_id, "status": status})
         return updated
 
@@ -1872,6 +2050,187 @@ Authorized knowledge sources:
         self.template_versions[version_id] = version.model_copy(update={"evaluation": evaluation})
         return evaluation
 
+    def list_template_evaluation_runs(
+        self,
+        version_id: str,
+        *,
+        active: bool | None = None,
+        limit: int = 20,
+    ) -> list[TemplateEvaluationRunRead]:
+        runs = [
+            run
+            for run in self.template_evaluation_runs.values()
+            if run.job_template_version_id == version_id
+        ]
+        if active is not None:
+            active_statuses = {"queued", "running", "waiting_for_approval"}
+            runs = [run for run in runs if (run.status in active_statuses) == active]
+        runs.sort(key=lambda run: run.started_at, reverse=True)
+        return runs[: max(limit, 1)]
+
+    def get_template_evaluation_run(self, version_id: str, run_id: str) -> TemplateEvaluationRunRead | None:
+        run = self.template_evaluation_runs.get(run_id)
+        if not run or run.job_template_version_id != version_id:
+            return None
+        return run
+
+    def start_template_evaluation_run(self, version_id: str, payload: TemplateEvaluationRunRequest) -> TemplateEvaluationRunRead:
+        version = self.template_versions.get(version_id)
+        if not version:
+            raise ValueError("岗位模板版本不存在")
+        if not payload.task_description.strip():
+            raise ValueError("评测任务描述不能为空")
+        active_runs = self.list_template_evaluation_runs(version_id, active=True, limit=1)
+        if active_runs:
+            raise ConflictError(f"该模板版本已有评测正在执行，请查看运行 {active_runs[0].id}")
+
+        now = _now_text()
+        run = TemplateEvaluationRunRead(
+            id=new_id("evalrun"),
+            job_template_version_id=version_id,
+            task_description=payload.task_description.strip(),
+            status="queued",
+            started_at=now,
+            updated_at=now,
+            steps=[
+                TemplateEvaluationRunStep(
+                    status="queued",
+                    message="评测运行已创建，等待后台执行。",
+                    created_at=now,
+                    details={"template_version_id": version_id, "template_role": version.role},
+                )
+            ],
+        )
+        self.template_evaluation_runs[run.id] = run
+        self._audit("template_evaluation_run_queued", {
+            "template_version_id": version_id,
+            "evaluation_run_id": run.id,
+        })
+        self._persist_runtime_state()
+
+        thread = threading.Thread(
+            target=self._execute_template_evaluation_run_async,
+            args=(run.id,),
+            name=f"template-eval-{run.id}",
+            daemon=True,
+        )
+        self._template_evaluation_run_threads[run.id] = thread
+        thread.start()
+        return run
+
+    def _persist_runtime_state(self) -> None:
+        if not getattr(self, "_persistence_enabled", False):
+            return
+        if not hasattr(self, "_save_relational_state"):
+            return
+        lock = getattr(self, "_state_lock", None)
+        try:
+            if lock:
+                with lock:
+                    self._save_relational_state()
+            else:
+                self._save_relational_state()
+        except Exception as exc:
+            logger.warning("Runtime state persistence failed error=%s", exc)
+
+    def _append_template_evaluation_run_step(
+        self,
+        run_id: str,
+        status: TemplateEvaluationRunStatus,
+        message: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        run = self.template_evaluation_runs.get(run_id)
+        if not run:
+            return
+        now = _now_text()
+        step = TemplateEvaluationRunStep(
+            status=status,
+            message=message,
+            created_at=now,
+            details=details or {},
+        )
+        next_status = status
+        if status in {"completed", "error"}:
+            next_status = "running" if run.status in {"queued", "running", "waiting_for_approval"} else run.status
+        self.template_evaluation_runs[run_id] = run.model_copy(update={
+            "status": next_status,
+            "updated_at": now,
+            "steps": [*run.steps, step],
+        })
+        self._persist_runtime_state()
+
+    def _finish_template_evaluation_run(self, run_id: str, result: dict[str, Any]) -> None:
+        run = self.template_evaluation_runs.get(run_id)
+        if not run:
+            return
+        now = _now_text()
+        final_status: TemplateEvaluationRunStatus = "completed" if result.get("status") == "completed" else "error"
+        hermes_output = (
+            result.get("hermes_output")
+            or result.get("output")
+            or result.get("response")
+            or result.get("result")
+            or json.dumps(result, ensure_ascii=False)
+        )
+        error_message = result.get("error_message")
+        if final_status == "error" and not error_message:
+            error_message = hermes_output or json.dumps(result, ensure_ascii=False)
+        message = "评测执行完成。" if final_status == "completed" else "评测执行失败。"
+        step = TemplateEvaluationRunStep(
+            status=final_status,
+            message=message,
+            created_at=now,
+            details={
+                "hermes_run_id": result.get("run_id") or "",
+                "error_message": error_message or "",
+            },
+        )
+        self.template_evaluation_runs[run_id] = run.model_copy(update={
+            "status": final_status,
+            "hermes_run_id": result.get("run_id") or None,
+            "hermes_output": hermes_output,
+            "error_message": error_message,
+            "updated_at": now,
+            "completed_at": now,
+            "steps": [*run.steps, step],
+        })
+        self._audit("template_evaluation_async_run_finished", {
+            "template_version_id": run.job_template_version_id,
+            "evaluation_run_id": run_id,
+            "status": final_status,
+            "hermes_run_id": result.get("run_id") or "",
+        })
+        self._persist_runtime_state()
+
+    def _execute_template_evaluation_run_async(self, run_id: str) -> None:
+        run = self.template_evaluation_runs.get(run_id)
+        if not run:
+            return
+        self._append_template_evaluation_run_step(run_id, "running", "后台评测任务已开始执行。")
+        try:
+            result = InMemoryStore.run_template_evaluation(
+                self,
+                run.job_template_version_id,
+                run.task_description,
+                progress_callback=lambda status, message, details=None: self._append_template_evaluation_run_step(
+                    run_id,
+                    status,
+                    message,
+                    details,
+                ),
+            )
+        except Exception as exc:
+            logger.exception("Template evaluation async run failed run_id=%s", run_id)
+            result = {
+                "run_id": "",
+                "task_description": run.task_description,
+                "hermes_output": "",
+                "status": "error",
+                "error_message": str(exc),
+            }
+        self._finish_template_evaluation_run(run_id, result)
+
     def _render_evaluation_soul(self, version: JobTemplateVersionRead) -> str:
         """将模板配置渲染为 Hermes Profile 的 SOUL.md 内容。"""
         parts: list[str] = []
@@ -1908,7 +2267,12 @@ Authorized knowledge sources:
             parts.append("")
         return "\n".join(parts)
 
-    def run_template_evaluation(self, version_id: str, task_description: str) -> dict:
+    def run_template_evaluation(
+        self,
+        version_id: str,
+        task_description: str,
+        progress_callback: Callable[[TemplateEvaluationRunStatus, str, dict[str, Any] | None], None] | None = None,
+    ) -> dict:
         """全流程模板评测：创建临时 Profile → 启动 Gateway → 执行 Run → 清理资源。
 
         步骤：
@@ -1922,6 +2286,14 @@ Authorized knowledge sources:
         version = self.template_versions.get(version_id)
         if not version:
             raise ValueError("岗位模板版本不存在")
+
+        def progress(status: TemplateEvaluationRunStatus, message: str, details: dict[str, Any] | None = None) -> None:
+            if not progress_callback:
+                return
+            try:
+                progress_callback(status, message, details or {})
+            except Exception as exc:
+                logger.warning("Template evaluation progress callback failed version_id=%s error=%s", version_id, exc)
 
         lock = self._eval_lock_for(version_id)
         if not lock.acquire(blocking=False):
@@ -1949,6 +2321,10 @@ Authorized knowledge sources:
                 profile_name,
                 port,
             )
+            progress("running", "已分配临时 Gateway 端口，准备创建 Hermes Profile。", {
+                "profile_name": profile_name,
+                "port": port,
+            })
 
             self._audit("template_evaluation_profile_creating", {
                 "template_version_id": version_id,
@@ -1975,6 +2351,11 @@ Authorized knowledge sources:
                 no_skills=True,
             )
             logger.info("Hermes evaluation profile created version_id=%s profile=%s", version_id, profile_name)
+            progress("running", "Hermes Profile 已创建。", {
+                "profile_name": profile_name,
+                "provider": provider,
+                "model": model,
+            })
 
             # 3. 写入 SOUL.md
             soul_content = self._render_evaluation_soul(version)
@@ -1986,6 +2367,10 @@ Authorized knowledge sources:
             )
             self._dashboard.write_soul(profile_name, soul_content)
             logger.info("Hermes evaluation SOUL written version_id=%s profile=%s", version_id, profile_name)
+            progress("running", "SOUL.md 已写入评测 Profile。", {
+                "profile_name": profile_name,
+                "soul_chars": len(soul_content),
+            })
 
             # 4. 创建评测期运行身份，并把模板能力注入 Profile
             eval_runtime = self._create_evaluation_runtime(version, profile_name, task_description)
@@ -2019,6 +2404,12 @@ Authorized knowledge sources:
                 len(tool_entries),
                 len(knowledge_entries),
             )
+            progress("running", "岗位模板能力已注入评测 Profile。", {
+                "profile_name": profile_name,
+                "skills": len(installed_skills),
+                "tools": len(tool_entries),
+                "knowledge_sources": len(knowledge_entries),
+            })
 
             # 5. 写入 Profile 运行时密钥，Hermes Gateway 启动时会加载该 .env
             profile_env = {
@@ -2043,6 +2434,9 @@ Authorized knowledge sources:
                 profile_name,
                 len(knowledge_hits),
             )
+            progress("running", "授权知识源预检索已完成。", {
+                "hit_count": len(knowledge_hits),
+            })
 
             # 6. 配置 API Server 端口（新 Profile 默认端口会与主 Gateway 冲突）
             logger.info(
@@ -2053,6 +2447,10 @@ Authorized knowledge sources:
                 bool(eval_api_key),
             )
             self._dashboard.write_gateway_port(profile_name, port, api_key=eval_api_key)
+            progress("running", "Gateway 端口与 API Key 已写入 Profile 配置。", {
+                "profile_name": profile_name,
+                "port": port,
+            })
 
             # 7. 启动 Gateway
             gw_result = self._dashboard.start_gateway(profile_name)
@@ -2065,6 +2463,12 @@ Authorized knowledge sources:
                 gw_result.get("pid"),
                 gw_log,
             )
+            progress("running", "Hermes Gateway 已启动，正在等待健康检查。", {
+                "profile_name": profile_name,
+                "port": port,
+                "pid": gw_result.get("pid"),
+                "log": gw_log,
+            })
 
             # 8. 等待 Gateway 就绪
             ready = self._dashboard.wait_gateway_ready(
@@ -2084,6 +2488,10 @@ Authorized knowledge sources:
                     f"端口 {port}，Profile: {profile_name}\n"
                     f"请查看 Gateway 日志: tail -100 {gw_log}"
                 )
+            progress("running", "Hermes Gateway 健康检查已通过。", {
+                "profile_name": profile_name,
+                "port": port,
+            })
 
             self._audit("template_evaluation_gateway_ready", {
                 "template_version_id": version_id,
@@ -2099,8 +2507,14 @@ Authorized knowledge sources:
                 port,
                 settings.eval_run_timeout_seconds,
             )
+            progress("running", "正在提交 Hermes 评测 Run。", {
+                "profile_name": profile_name,
+                "port": port,
+                "timeout_seconds": settings.eval_run_timeout_seconds,
+            })
+            hermes_base_url = f"http://127.0.0.1:{port}"
             hermes = HermesClient(
-                f"http://127.0.0.1:{port}",
+                hermes_base_url,
                 eval_api_key,
                 timeout_seconds=settings.eval_run_timeout_seconds,
             )
@@ -2111,15 +2525,37 @@ Authorized knowledge sources:
                 knowledge_entries,
                 knowledge_hits,
             )
+            def handle_waiting_for_approval(run: dict[str, Any]) -> None:
+                approval = self._register_hermes_evaluation_approval(
+                    version=version,
+                    profile_name=profile_name,
+                    port=port,
+                    run=run,
+                    hermes_base_url=hermes_base_url,
+                    hermes_api_key=eval_api_key,
+                )
+                progress("waiting_for_approval", "Hermes Run 正在等待人工审批。", {
+                    "approval_id": approval.id if approval else None,
+                    "hermes_run_id": run.get("run_id") or run.get("id") or "",
+                    "profile_name": profile_name,
+                    "port": port,
+                })
+
             result = hermes.create_and_wait_run(
                 evaluation_prompt,
                 metadata={"purpose": "template_evaluation", "template_version_id": version_id},
                 max_wait_seconds=settings.eval_run_timeout_seconds,
+                on_waiting_for_approval=handle_waiting_for_approval,
             )
             run_id = result.get("run_id") or result.get("id") or "unknown"
-            output = result.get("output") or json.dumps(result, ensure_ascii=False)
+            raw_output = result.get("output")
+            raw_output_text = str(raw_output).strip() if raw_output is not None else ""
+            output = raw_output_text or json.dumps(result, ensure_ascii=False)
             run_status = result.get("status", "unknown")
-            is_completed = run_status == "completed"
+            incomplete_output = run_status == "completed" and (
+                not raw_output_text or _looks_like_incomplete_evaluation_output(raw_output_text)
+            )
+            is_completed = run_status == "completed" and not incomplete_output
             if is_completed:
                 logger.info(
                     "Hermes evaluation run completed version_id=%s profile=%s run_id=%s output_chars=%s",
@@ -2128,16 +2564,31 @@ Authorized knowledge sources:
                     run_id,
                     len(output),
                 )
+                progress("completed", "Hermes 评测 Run 已完成。", {
+                    "hermes_run_id": run_id,
+                    "output_chars": len(output),
+                })
             else:
+                failure_status = "incomplete_output" if incomplete_output else run_status
+                failure_message = (
+                    "Hermes Run 已结束，但只返回了后台/异步任务的中间状态，未返回最终评测结果。"
+                    if incomplete_output
+                    else f"Hermes 评测 Run 未完成，状态为 {run_status}。"
+                )
                 logger.warning(
                     "Hermes evaluation run ended non-completed version_id=%s profile=%s run_id=%s status=%s output_chars=%s output_preview=%s",
                     version_id,
                     profile_name,
                     run_id,
-                    run_status,
+                    failure_status,
                     len(output),
                     _log_preview(output),
                 )
+                progress("error", failure_message, {
+                    "hermes_run_id": run_id,
+                    "hermes_status": failure_status,
+                    "output_preview": _log_preview(output),
+                })
 
             self._audit("template_evaluation_run_completed", {
                 "template_version_id": version_id,
@@ -2152,7 +2603,12 @@ Authorized knowledge sources:
                 "task_description": task_description,
                 "hermes_output": output,
                 "status": "completed" if is_completed else "error",
-                "error_message": None if is_completed else f"Hermes 运行状态: {run_status}\n{output}",
+                "error_message": None if is_completed else (
+                    "Hermes 已结束但未返回最终评测结果。\n"
+                    f"Hermes 运行状态: {run_status}\n{output}"
+                    if incomplete_output
+                    else f"Hermes 运行状态: {run_status}\n{output}"
+                ),
             }
 
         except (httpx.HTTPError, ValueError, RuntimeError) as exc:
@@ -2171,6 +2627,11 @@ Authorized knowledge sources:
                 port,
                 _log_preview(error_msg),
             )
+            progress("error", "模板评测执行失败。", {
+                "profile_name": profile_name,
+                "port": port,
+                "error": error_msg,
+            })
             self._audit("template_evaluation_run_failed", {
                 "template_version_id": version_id,
                 "profile_name": profile_name,
@@ -2395,6 +2856,7 @@ class PostgresBackedStore(InMemoryStore):
         "delete_job_template_version",
         "set_job_template_version_status",
         "update_template_evaluation",
+        "start_template_evaluation_run",
         "run_template_evaluation",
         "create_digital_employee",
         "patch_employee_organization",
@@ -2483,6 +2945,7 @@ class PostgresBackedStore(InMemoryStore):
             "review_tasks": self._dump_model_dict(self.review_tasks),
             "departments": self._dump_model_dict(self.departments),
             "template_versions": self._dump_model_dict(self.template_versions),
+            "template_evaluation_runs": self._dump_model_dict(self.template_evaluation_runs),
             "employees": self._dump_model_dict(self.employees),
         }
         save_relational_state(payload)
@@ -2496,8 +2959,10 @@ class PostgresBackedStore(InMemoryStore):
 
     def _restore_state(self, payload: dict[str, Any]) -> None:
         self._state_loading = True
+        hermes_approval_runtime = dict(getattr(self, "_hermes_approval_runtime", {}))
         try:
             InMemoryStore.reset(self)
+            self._hermes_approval_runtime = hermes_approval_runtime
             self.secret_values = dict(payload.get("secret_values", self.secret_values))
             self.credentials = self._load_model_dict(payload, "credentials", CredentialRead)
             self.model_configurations = self._load_model_dict(payload, "model_configurations", ModelConfigurationRead)
@@ -2526,7 +2991,13 @@ class PostgresBackedStore(InMemoryStore):
             self.review_tasks = self._load_model_dict(payload, "review_tasks", ReviewTaskRead)
             self.departments = self._load_model_dict(payload, "departments", DepartmentRead)
             self.template_versions = self._load_model_dict(payload, "template_versions", JobTemplateVersionRead)
+            self.template_evaluation_runs = self._load_model_dict(payload, "template_evaluation_runs", TemplateEvaluationRunRead)
             self.employees = self._load_model_dict(payload, "employees", DigitalEmployeeRead)
+            self._hermes_approval_runtime = {
+                approval_id: runtime
+                for approval_id, runtime in hermes_approval_runtime.items()
+                if approval_id in self.approvals
+            }
         finally:
             self._state_loading = False
 

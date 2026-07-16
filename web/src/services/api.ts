@@ -19,6 +19,7 @@ import type {
   OrganizationQuotaPolicy,
   SkillDefinition,
   TemplateEvaluation,
+  TemplateEvaluationRun,
   TemplateOutcomeReport,
   ToolDefinition,
   UsageAnalyticsRow,
@@ -194,6 +195,48 @@ function mapEvaluation(evaluation: BackendEvaluation): TemplateEvaluation {
   };
 }
 
+export type BackendTemplateEvaluationRun = {
+  id: string;
+  job_template_version_id: string;
+  task_description: string;
+  status: TemplateEvaluationRun['status'];
+  hermes_run_id?: string | null;
+  hermes_output: string;
+  error_message?: string | null;
+  started_at: string;
+  updated_at: string;
+  completed_at?: string | null;
+  steps: Array<{
+    id: string;
+    status: TemplateEvaluationRun['status'];
+    message: string;
+    created_at: string;
+    details: Record<string, unknown>;
+  }>;
+};
+
+export function mapTemplateEvaluationRun(run: BackendTemplateEvaluationRun): TemplateEvaluationRun {
+  return {
+    id: run.id,
+    templateId: run.job_template_version_id,
+    taskDescription: run.task_description,
+    status: run.status,
+    hermesRunId: run.hermes_run_id ?? undefined,
+    hermesOutput: run.hermes_output,
+    errorMessage: run.error_message ?? undefined,
+    startedAt: run.started_at,
+    updatedAt: run.updated_at,
+    completedAt: run.completed_at ?? undefined,
+    steps: run.steps.map((step) => ({
+      id: step.id,
+      status: step.status,
+      message: step.message,
+      createdAt: step.created_at,
+      details: step.details ?? {},
+    })),
+  };
+}
+
 export function mapTemplate(template: BackendTemplate): JobTemplate {
   return {
     id: template.id,
@@ -307,7 +350,7 @@ const modelTypeToBackend: Record<ModelType, string> = {
   audio: 'speech_model',
 };
 
-type BackendModel = {
+export type BackendModel = {
   id: string;
   name: string;
   model_type: string;

@@ -174,6 +174,30 @@ export interface TemplateEvaluation {
   summary: string;
 }
 
+export type TemplateEvaluationRunStatus = 'queued' | 'running' | 'waiting_for_approval' | 'completed' | 'error';
+
+export interface TemplateEvaluationRunStep {
+  id: string;
+  status: TemplateEvaluationRunStatus;
+  message: string;
+  createdAt: string;
+  details: Record<string, unknown>;
+}
+
+export interface TemplateEvaluationRun {
+  id: string;
+  templateId: string;
+  taskDescription: string;
+  status: TemplateEvaluationRunStatus;
+  hermesRunId?: string;
+  hermesOutput: string;
+  errorMessage?: string;
+  startedAt: string;
+  updatedAt: string;
+  completedAt?: string;
+  steps: TemplateEvaluationRunStep[];
+}
+
 export interface BusinessOutcomeMetricBinding {
   id: string;
   name: string;

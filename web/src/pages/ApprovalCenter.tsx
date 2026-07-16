@@ -116,6 +116,7 @@ export default function ApprovalCenter() {
       decision_reason?: string;
     }>>('/approvals');
     setApprovals(items.map((item) => {
+      const context = item.context ?? {};
       const typeMap: Record<string, ApprovalType> = {
         tool_call: 'tool_call',
         budget_overrun: 'budget',
@@ -129,9 +130,18 @@ export default function ApprovalCenter() {
         high: 'L3',
         critical: 'L4',
       };
+      const isHermesEvaluationApproval = context.source === 'hermes_evaluation_run';
+      const evidence = isHermesEvaluationApproval
+        ? [
+            item.id,
+            context.template_version_id,
+            context.profile_name,
+            context.hermes_run_id,
+          ].filter((value): value is string => typeof value === 'string' && value.length > 0)
+        : [item.id];
       return {
         id: item.id,
-        title: `${typeMeta[typeMap[item.approval_type]].label}审批`,
+        title: isHermesEvaluationApproval ? '岗位模板评测审批' : `${typeMeta[typeMap[item.approval_type]].label}审批`,
         type: typeMap[item.approval_type],
         status: item.status,
         riskLevel: riskMap[item.risk_level],
@@ -143,9 +153,13 @@ export default function ApprovalCenter() {
         goalId: item.goal_run_id,
         workItemId: item.work_item_id,
         artifactId: item.artifact_id,
-        summary: JSON.stringify(item.context),
-        proposedAction: '等待审批人处理后继续或拒绝。',
-        evidence: [item.id],
+        summary: isHermesEvaluationApproval
+          ? `岗位模板评测「${String(context.template_role ?? context.template_version_id ?? '-')}」中的 Hermes Run ${String(context.hermes_run_id ?? '-')} 正在等待人工审批。`
+          : JSON.stringify(context),
+        proposedAction: isHermesEvaluationApproval
+          ? '通过后允许本次 Hermes 待审批操作一次，并恢复评测；拒绝后阻止该操作。'
+          : '等待审批人处理后继续或拒绝。',
+        evidence,
         decisionReason: item.decision_reason,
       };
     }));
@@ -204,6 +218,7 @@ export default function ApprovalCenter() {
       reason: decisionReason || statusMeta[decisionAction].label,
     });
     await loadApprovals();
+    window.dispatchEvent(new Event('platform-approvals-updated'));
     setSelectedApproval(null);
     setDecisionOpen(false);
   };

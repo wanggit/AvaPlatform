@@ -61,6 +61,23 @@ def create_runtime_support_tables() -> None:
             )
             """
         )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS template_evaluation_runs (
+                id text PRIMARY KEY,
+                job_template_version_id varchar(120) NOT NULL,
+                task_description text NOT NULL,
+                status varchar(40) NOT NULL,
+                hermes_run_id text,
+                hermes_output text NOT NULL DEFAULT '',
+                error_message text,
+                started_at text NOT NULL,
+                updated_at text NOT NULL,
+                completed_at text,
+                steps_json jsonb NOT NULL DEFAULT '[]'::jsonb
+            )
+            """
+        )
         # Backfill columns that may be missing from tables created before the ORM model was updated.
         connection.execute(
             """

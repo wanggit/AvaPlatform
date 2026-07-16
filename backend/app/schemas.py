@@ -74,6 +74,31 @@ class TemplateEvaluationRunResponse(BaseModel):
     error_message: str | None = None
 
 
+TemplateEvaluationRunStatus = Literal["queued", "running", "waiting_for_approval", "completed", "error"]
+
+
+class TemplateEvaluationRunStep(BaseModel):
+    id: str = Field(default_factory=lambda: new_id("eval-step"))
+    status: TemplateEvaluationRunStatus
+    message: str
+    created_at: str
+    details: dict = Field(default_factory=dict)
+
+
+class TemplateEvaluationRunRead(BaseModel):
+    id: str
+    job_template_version_id: str
+    task_description: str
+    status: TemplateEvaluationRunStatus = "queued"
+    hermes_run_id: str | None = None
+    hermes_output: str = ""
+    error_message: str | None = None
+    started_at: str
+    updated_at: str
+    completed_at: str | None = None
+    steps: list[TemplateEvaluationRunStep] = Field(default_factory=list)
+
+
 class DepartmentCreate(BaseModel):
     name: str
     description: str | None = None
